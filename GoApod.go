@@ -1,9 +1,11 @@
 package goapod
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 )
@@ -140,4 +142,36 @@ func (a *ApodResponse) FetchImage(hdurl bool) ([]byte, error) {
 
 	body, err := io.ReadAll(resp.Body)
 	return body, err
+}
+
+func (a *ApodResponse) SaveToDb2(connStr string) error {
+	db, err := sql.Open("go_ibm_db", connStr)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	query := `
+    INSERT INTO apod (
+        apod_date, title, explanation, media_type, url, hdurl, service_version, copyright
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `
+
+	_, err = db.Exec(
+		query,
+		a.Date,
+		a.Title,
+		a.Explanation,
+		a.MediaType,
+		a.URL,
+		a.Hdurl,
+		a.ServiceVersion,
+		sql.NullString{String: "", Valid: false}, // Copyright: optional
+	)
+
+	if err != nil {
+		log.Printf("Failed to insert APOD %s: %v\n", a.Date, err)
+	}
+
+	return err
 }
