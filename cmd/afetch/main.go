@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/TWolfis/goapod"
+	_ "github.com/ibmdb/go_ibm_db" // Import DB2 driver for side effects
 	"gopkg.in/yaml.v3"
 )
 
@@ -109,15 +109,10 @@ func (opt *Options) ToYaml(dst string) error {
 	return nil
 }
 
-func VerifyDate(date string) error {
-	_, err := time.Parse("2006-1-1", date)
-	return err
-}
-
 func PrintApod(a *goapod.Apod) {
 	if len(a.Responses) == 0 {
 		ar := a.Response
-		fmt.Printf("Title: %s\nDate: %s\nExplanation: %s\nURL: %s",
+		fmt.Printf("Title: %s\nDate: %s\nExplanation: %s\nURL: %s\n",
 			ar.Title, ar.Date, ar.Explanation, ar.URL)
 	} else if len(a.Responses) > 1 {
 		for _, ar := range a.Responses {
@@ -206,25 +201,10 @@ func main() {
 	a := goapod.Apod{}
 
 	if opts.Date != "" {
-		err := VerifyDate(opts.Date)
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
-		}
 		a.Date = opts.Date
 	} else if opts.Startdate != "" && opts.Enddate != "" {
-		err := VerifyDate(opts.Startdate)
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
-		}
 		a.StartDate = opts.Startdate
 
-		err = VerifyDate(opts.Enddate)
-		if err != nil {
-			fmt.Println(err)
-			os.Exit(1)
-		}
 		a.EndDate = opts.Enddate
 	}
 
