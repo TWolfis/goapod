@@ -5,10 +5,15 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/TWolfis/goapod"
 	_ "github.com/go-sql-driver/mysql" // Import MySQL driver for side effects
 	"gopkg.in/yaml.v3"
+)
+
+const (
+	FIRST_DATE = "1995-06-16" // First date of APOD
 )
 
 // Custom usage function for better help formatting
@@ -32,6 +37,7 @@ EXAMPLES:
 
 ENVIRONMENT VARIABLES:
     MYSQL_PASSWORD             MySQL database password (alternative to --mysql-pass flag)
+    NASA_API_KEY               NASA API key for APOD service (alternative to --api-key flag)
 
 `, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
 	}
@@ -43,6 +49,7 @@ ENVIRONMENT VARIABLES:
 	flag.StringVar(&opts.Date, "d", "", "date for APOD in format YYYY-MM-DD")
 	flag.StringVar(&opts.Startdate, "sd", "", "start date for APOD range in format YYYY-MM-DD")
 	flag.StringVar(&opts.Enddate, "ed", "", "end date for APOD range in format YYYY-MM-DD")
+	flag.StringVar(&opts.ApiKey, "api-key", "", "NASA API key for APOD service")
 
 	flag.BoolVar(&opts.MySQL, "mysql", false, "save to MySQL database")
 	flag.StringVar(&opts.MySQLUser, "mysql-user", "root", "MySQL username")
@@ -52,6 +59,7 @@ ENVIRONMENT VARIABLES:
 	flag.StringVar(&opts.MySQLDatabase, "mysql-db", "nasa", "MySQL database name")
 	flag.StringVar(&opts.MySQLTable, "mysql-table", "apod", "MySQL table name")
 
+	flag.BoolVar(&everyting, "everything", false, "fetch everything")
 	flag.BoolVar(&saveToYaml, "save-yaml", false, "save options to YAML file")
 	flag.BoolVar(&readFromYaml, "read-yaml", false, "read options from YAML file")
 	flag.StringVar(&yamlFile, "yaml-file", "apod_options.yaml", "YAML file path for saving/reading options")
@@ -61,6 +69,7 @@ ENVIRONMENT VARIABLES:
 // Global variables for flags
 var (
 	opts         Options
+	everyting    bool
 	saveToYaml   bool
 	readFromYaml bool
 	yamlFile     string
@@ -74,6 +83,7 @@ type Options struct {
 	Download  bool   `yaml:"download"`
 	DstFile   string `yaml:"dstFile"`
 	Hdurl     bool   `yaml:"hdurl"`
+	ApiKey    string `yaml:"apiKey"`
 
 	MySQL         bool   `yaml:"mysql"`
 	MySQLPassword string `yaml:"mysqlPassword"`
@@ -110,6 +120,48 @@ func (opt *Options) ToYaml(dst string) error {
 		return fmt.Errorf("error writing options to file: %w", err)
 	}
 
+	return nil
+}
+
+func Everything(opts *Options, a *goapod.Apod) error {
+	opts.Startdate = FIRST_DATE
+	today := time.Now().Format("2006-01-02")
+	opts.Enddate = today
+
+	daysleft := time.Since(time.Date(1995, 6, 16, 0, 0, 0, 0, time.UTC)).Hours() / 24
+
+	// iterate over each week from FIRST_DATE to today
+	for i := 0; i <= int(daysleft); i += 7 {
+		startDate := time.Date(1995, 6, 16, 0, 0, 0, 0, time.UTC).AddDate(0, 0, i).Format("2006-01-02")
+		endDate := time.Date(1995, 6, 16, 0, 0, 0, 0, time.UTC).AddDate(0, 0, i+6).Format("2006-01-02")
+
+		a.StartDate = startDate
+		a.EndDate = endDate
+
+		err := a.Fetch()
+		if err != nil {
+			return fmt.Errorf("error fetching APOD for range %s to %s: %w", startDate, endDate, err)
+		}
+
+		if len(a.Responses) > 0 {
+			fmt.Printf("Fetched APOD from %s to %s\n", startDate, endDate)
+			PrintApod(a)
+		}
+
+		if opts.Download {
+			err = SaveImage(a, opts.DstFile, opts.Hdurl)
+			if err != nil {
+				return fmt.Errorf("error downloading image for range %s to %s: %w", startDate, endDate, err)
+			}
+		}
+		if opts.MySQL {
+			err := SaveToMySQL(a, opts)
+			if err != nil {
+				return fmt.Errorf("error saving to MySQL for range %s to %s: %w", startDate, endDate, err)
+			}
+		}
+		fmt.Printf("APOD for range %s to %s processed successfully.\n", startDate, endDate)
+	}
 	return nil
 }
 
@@ -206,11 +258,27 @@ func main() {
 
 	a := goapod.Apod{}
 
+	// Set API key from flag or environment variable
+	if opts.ApiKey != "" {
+		a.ApiKey = opts.ApiKey
+	} else if envApiKey := os.Getenv("NASA_API_KEY"); envApiKey != "" {
+		a.ApiKey = envApiKey
+	}
+	// If no API key is provided, the goapod package will use "DEMO_KEY" by default
+
+	if everyting {
+		err = Everything(&opts, &a)
+		if err != nil {
+			fmt.Printf("Error fetching everything: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
 	if opts.Date != "" {
 		a.Date = opts.Date
 	} else if opts.Startdate != "" && opts.Enddate != "" {
 		a.StartDate = opts.Startdate
-
 		a.EndDate = opts.Enddate
 	}
 
