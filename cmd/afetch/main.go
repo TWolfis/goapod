@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/TWolfis/goapod"
-	_ "github.com/ibmdb/go_ibm_db" // Import DB2 driver for side effects
+	_ "github.com/go-sql-driver/mysql" // Import MySQL driver for side effects
 	"gopkg.in/yaml.v3"
 )
 
@@ -31,7 +31,7 @@ EXAMPLES:
     %s --read-yaml --yaml-file config.yaml  # Read options from YAML
 
 ENVIRONMENT VARIABLES:
-    DB2_PASSWORD               DB2 database password (alternative to --db2pass flag)
+    MYSQL_PASSWORD             MySQL database password (alternative to --mysql-pass flag)
 
 `, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
 	}
@@ -44,11 +44,13 @@ ENVIRONMENT VARIABLES:
 	flag.StringVar(&opts.Startdate, "sd", "", "start date for APOD range in format YYYY-MM-DD")
 	flag.StringVar(&opts.Enddate, "ed", "", "end date for APOD range in format YYYY-MM-DD")
 
-	flag.BoolVar(&opts.Db2, "db2", false, "save to DB2 database")
-	flag.StringVar(&opts.Db2User, "db2user", "db2inst1", "DB2 username")
-	flag.StringVar(&opts.Db2Password, "db2pass", "", "DB2 password")
-	flag.StringVar(&opts.Db2Database, "db2db", "nasa", "DB2 database name")
-	flag.StringVar(&opts.Db2Table, "db2table", "apod", "DB2 table name")
+	flag.BoolVar(&opts.MySQL, "mysql", false, "save to MySQL database")
+	flag.StringVar(&opts.MySQLUser, "mysql-user", "root", "MySQL username")
+	flag.StringVar(&opts.MySQLPassword, "mysql-pass", "", "MySQL password")
+	flag.StringVar(&opts.MySQLHost, "mysql-host", "localhost", "MySQL hostname")
+	flag.StringVar(&opts.MySQLPort, "mysql-port", "3306", "MySQL port")
+	flag.StringVar(&opts.MySQLDatabase, "mysql-db", "nasa", "MySQL database name")
+	flag.StringVar(&opts.MySQLTable, "mysql-table", "apod", "MySQL table name")
 
 	flag.BoolVar(&saveToYaml, "save-yaml", false, "save options to YAML file")
 	flag.BoolVar(&readFromYaml, "read-yaml", false, "read options from YAML file")
@@ -73,11 +75,13 @@ type Options struct {
 	DstFile   string `yaml:"dstFile"`
 	Hdurl     bool   `yaml:"hdurl"`
 
-	Db2         bool   `yaml:"db2"`
-	Db2Password string `yaml:"db2Password"`
-	Db2Database string `yaml:"db2Database"`
-	Db2Table    string `yaml:"db2Table"`
-	Db2User     string `yaml:"db2User"`
+	MySQL         bool   `yaml:"mysql"`
+	MySQLPassword string `yaml:"mysqlPassword"`
+	MySQLDatabase string `yaml:"mysqlDatabase"`
+	MySQLTable    string `yaml:"mysqlTable"`
+	MySQLUser     string `yaml:"mysqlUser"`
+	MySQLHost     string `yaml:"mysqlHost"`
+	MySQLPort     string `yaml:"mysqlPort"`
 }
 
 func SetOptionsFromFile(filePath string) (*Options, error) {
@@ -151,23 +155,25 @@ func SaveImage(a *goapod.Apod, dstFile string, hdurl bool) error {
 	return nil
 }
 
-func SaveToDb2(a *goapod.Apod, opts *Options) error {
-	if opts.Db2Password == "" {
-		opts.Db2Password = os.Getenv("DB2_PASSWORD")
+func SaveToMySQL(a *goapod.Apod, opts *Options) error {
+	if opts.MySQLPassword == "" {
+		opts.MySQLPassword = os.Getenv("MYSQL_PASSWORD")
 
-		if opts.Db2Password == "" {
-			fmt.Println("DB2 password not set. Please set the DB2_PASSWORD environment variable or flag.")
-			return fmt.Errorf("DB2 password not set")
+		if opts.MySQLPassword == "" {
+			fmt.Println("MySQL password not set. Please set the MYSQL_PASSWORD environment variable or flag.")
+			return fmt.Errorf("MySQL password not set")
 		}
 	}
 
+	// Create MySQL connection string
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s",
+		opts.MySQLUser, opts.MySQLPassword, opts.MySQLHost, opts.MySQLPort, opts.MySQLDatabase)
+
 	if len(a.Responses) == 0 {
-		return a.Response.SaveToDb2(fmt.Sprintf("user=%s password=%s database=%s table=%s",
-			opts.Db2User, opts.Db2Password, opts.Db2Database, opts.Db2Table))
+		return a.Response.SaveToMySQL(dsn, opts.MySQLTable)
 	} else if len(a.Responses) > 1 {
 		for _, ar := range a.Responses {
-			err := ar.SaveToDb2(fmt.Sprintf("user=%s password=%s database=%s table=%s",
-				opts.Db2User, opts.Db2Password, opts.Db2Database, opts.Db2Table))
+			err := ar.SaveToMySQL(dsn, opts.MySQLTable)
 			if err != nil {
 				return err
 			}
@@ -235,14 +241,14 @@ func main() {
 		fmt.Printf("Options saved to %s\n", yamlFile)
 	}
 
-	// save to DB2
-	if opts.Db2 {
-		err := SaveToDb2(&a, &opts)
+	// save to MySQL
+	if opts.MySQL {
+		err := SaveToMySQL(&a, &opts)
 		if err != nil {
-			fmt.Println("Error saving to DB2:", err)
+			fmt.Println("Error saving to MySQL:", err)
 			os.Exit(1)
 		}
-		fmt.Println("APOD saved to DB2 successfully.")
+		fmt.Println("APOD saved to MySQL successfully.")
 	}
 
 }

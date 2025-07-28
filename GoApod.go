@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -171,6 +172,51 @@ func (a *ApodResponse) SaveToDb2(connStr string) error {
 
 	if err != nil {
 		log.Printf("Failed to insert APOD %s: %v\n", a.Date, err)
+	}
+
+	return err
+}
+
+func (a *ApodResponse) SaveToMySQL(dsn, tableName string) error {
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	// Test the connection
+	if err = db.Ping(); err != nil {
+		return err
+	}
+
+	query := fmt.Sprintf(`
+    INSERT INTO %s (
+        apod_date, title, explanation, media_type, url, hdurl, service_version, copyright
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE
+        title = VALUES(title),
+        explanation = VALUES(explanation),
+        media_type = VALUES(media_type),
+        url = VALUES(url),
+        hdurl = VALUES(hdurl),
+        service_version = VALUES(service_version),
+        copyright = VALUES(copyright)
+    `, tableName)
+
+	_, err = db.Exec(
+		query,
+		a.Date,
+		a.Title,
+		a.Explanation,
+		a.MediaType,
+		a.URL,
+		a.Hdurl,
+		a.ServiceVersion,
+		sql.NullString{String: "", Valid: false}, // Copyright: optional
+	)
+
+	if err != nil {
+		log.Printf("Failed to insert/update APOD %s: %v\n", a.Date, err)
 	}
 
 	return err
