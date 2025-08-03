@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/TWolfis/goapod"
-	_ "github.com/lib/pq" // Import PostgreSQL driver for CockroachDB
+	_ "github.com/go-sql-driver/mysql" // Import MySQL driver for side effects
 	"gopkg.in/yaml.v3"
 )
 
@@ -36,7 +36,7 @@ EXAMPLES:
     %s --read-yaml --yaml-file config.yaml  # Read options from YAML
 
 ENVIRONMENT VARIABLES:
-    COCKROACH_PASSWORD         CockroachDB database password (alternative to --cockroach-pass flag)
+    MYSQL_PASSWORD             MySQL database password (alternative to --mysql-pass flag)
     NASA_API_KEY               NASA API key for APOD service (alternative to --api-key flag)
 
 `, os.Args[0], os.Args[0], os.Args[0], os.Args[0], os.Args[0])
@@ -51,13 +51,13 @@ ENVIRONMENT VARIABLES:
 	flag.StringVar(&opts.Enddate, "ed", "", "end date for APOD range in format YYYY-MM-DD")
 	flag.StringVar(&opts.ApiKey, "api-key", "", "NASA API key for APOD service")
 
-	flag.BoolVar(&opts.Cockroach, "cockroach", false, "save to CockroachDB database")
-	flag.StringVar(&opts.CockroachUser, "cockroach-user", "root", "CockroachDB username")
-	flag.StringVar(&opts.CockroachPassword, "cockroach-pass", "", "CockroachDB password")
-	flag.StringVar(&opts.CockroachHost, "cockroach-host", "localhost", "CockroachDB hostname")
-	flag.StringVar(&opts.CockroachPort, "cockroach-port", "26257", "CockroachDB port")
-	flag.StringVar(&opts.CockroachDatabase, "cockroach-db", "nasa", "CockroachDB database name")
-	flag.StringVar(&opts.CockroachTable, "cockroach-table", "apod", "CockroachDB table name")
+	flag.BoolVar(&opts.MySQL, "mysql", false, "save to MySQL database")
+	flag.StringVar(&opts.MySQLUser, "mysql-user", "root", "MySQL username")
+	flag.StringVar(&opts.MySQLPassword, "mysql-pass", "", "MySQL password")
+	flag.StringVar(&opts.MySQLHost, "mysql-host", "localhost", "MySQL hostname")
+	flag.StringVar(&opts.MySQLPort, "mysql-port", "3306", "MySQL port")
+	flag.StringVar(&opts.MySQLDatabase, "mysql-db", "nasa", "MySQL database name")
+	flag.StringVar(&opts.MySQLTable, "mysql-table", "apod", "MySQL table name")
 
 	flag.BoolVar(&everyting, "everything", false, "fetch everything")
 	flag.BoolVar(&saveToYaml, "save-yaml", false, "save options to YAML file")
@@ -85,13 +85,13 @@ type Options struct {
 	Hdurl     bool   `yaml:"hdurl"`
 	ApiKey    string `yaml:"apiKey"`
 
-	Cockroach         bool   `yaml:"cockroach"`
-	CockroachPassword string `yaml:"cockroachPassword"`
-	CockroachDatabase string `yaml:"cockroachDatabase"`
-	CockroachTable    string `yaml:"cockroachTable"`
-	CockroachUser     string `yaml:"cockroachUser"`
-	CockroachHost     string `yaml:"cockroachHost"`
-	CockroachPort     string `yaml:"cockroachPort"`
+	MySQL         bool   `yaml:"mysql"`
+	MySQLPassword string `yaml:"mysqlPassword"`
+	MySQLDatabase string `yaml:"mysqlDatabase"`
+	MySQLTable    string `yaml:"mysqlTable"`
+	MySQLUser     string `yaml:"mysqlUser"`
+	MySQLHost     string `yaml:"mysqlHost"`
+	MySQLPort     string `yaml:"mysqlPort"`
 }
 
 func SetOptionsFromFile(filePath string) (*Options, error) {
@@ -154,10 +154,10 @@ func Everything(opts *Options, a *goapod.Apod) error {
 				return fmt.Errorf("error downloading image for range %s to %s: %w", startDate, endDate, err)
 			}
 		}
-		if opts.Cockroach {
-			err := SaveToCockroach(a, opts)
+		if opts.MySQL {
+			err := SaveToMySQL(a, opts)
 			if err != nil {
-				return fmt.Errorf("error saving to CockroachDB for range %s to %s: %w", startDate, endDate, err)
+				return fmt.Errorf("error saving to MySQL for range %s to %s: %w", startDate, endDate, err)
 			}
 		}
 		fmt.Printf("APOD for range %s to %s processed successfully.\n", startDate, endDate)
@@ -207,25 +207,25 @@ func SaveImage(a *goapod.Apod, dstFile string, hdurl bool) error {
 	return nil
 }
 
-func SaveToCockroach(a *goapod.Apod, opts *Options) error {
-	if opts.CockroachPassword == "" {
-		opts.CockroachPassword = os.Getenv("COCKROACH_PASSWORD")
+func SaveToMySQL(a *goapod.Apod, opts *Options) error {
+	if opts.MySQLPassword == "" {
+		opts.MySQLPassword = os.Getenv("MYSQL_PASSWORD")
 
-		if opts.CockroachPassword == "" {
-			fmt.Println("CockroachDB password not set. Please set the COCKROACH_PASSWORD environment variable or flag.")
-			return fmt.Errorf("CockroachDB password not set")
+		if opts.MySQLPassword == "" {
+			fmt.Println("MySQL password not set. Please set the MYSQL_PASSWORD environment variable or flag.")
+			return fmt.Errorf("MySQL password not set")
 		}
 	}
 
-	// Create CockroachDB connection string (PostgreSQL format)
-	dsn := fmt.Sprintf("postgresql://%s:%s@%s:%s/%s?sslmode=require",
-		opts.CockroachUser, opts.CockroachPassword, opts.CockroachHost, opts.CockroachPort, opts.CockroachDatabase)
+	// Create MySQL connection string
+	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s",
+		opts.MySQLUser, opts.MySQLPassword, opts.MySQLHost, opts.MySQLPort, opts.MySQLDatabase)
 
 	if len(a.Responses) == 0 {
-		return a.Response.SaveToCockroach(dsn, opts.CockroachTable)
+		return a.Response.SaveToMySQL(dsn, opts.MySQLTable)
 	} else if len(a.Responses) > 1 {
 		for _, ar := range a.Responses {
-			err := ar.SaveToCockroach(dsn, opts.CockroachTable)
+			err := ar.SaveToMySQL(dsn, opts.MySQLTable)
 			if err != nil {
 				return err
 			}
@@ -309,14 +309,14 @@ func main() {
 		fmt.Printf("Options saved to %s\n", yamlFile)
 	}
 
-	// save to CockroachDB
-	if opts.Cockroach {
-		err := SaveToCockroach(&a, &opts)
+	// save to MySQL
+	if opts.MySQL {
+		err := SaveToMySQL(&a, &opts)
 		if err != nil {
-			fmt.Println("Error saving to CockroachDB:", err)
+			fmt.Println("Error saving to MySQL:", err)
 			os.Exit(1)
 		}
-		fmt.Println("APOD saved to CockroachDB successfully.")
+		fmt.Println("APOD saved to MySQL successfully.")
 	}
 
 }

@@ -145,8 +145,8 @@ func (a *ApodResponse) FetchImage(hdurl bool) ([]byte, error) {
 	return body, err
 }
 
-func (a *ApodResponse) SaveToCockroach(dsn, tableName string) error {
-	db, err := sql.Open("postgres", dsn)
+func (a *ApodResponse) SaveToMySQL(dsn, tableName string) error {
+	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return err
 	}
@@ -160,15 +160,15 @@ func (a *ApodResponse) SaveToCockroach(dsn, tableName string) error {
 	query := fmt.Sprintf(`
     INSERT INTO %s (
         apod_date, title, explanation, media_type, url, hdurl, service_version, copyright
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-    ON CONFLICT (apod_date) DO UPDATE SET
-        title = EXCLUDED.title,
-        explanation = EXCLUDED.explanation,
-        media_type = EXCLUDED.media_type,
-        url = EXCLUDED.url,
-        hdurl = EXCLUDED.hdurl,
-        service_version = EXCLUDED.service_version,
-        copyright = EXCLUDED.copyright
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON DUPLICATE KEY UPDATE
+        title = VALUES(title),
+        explanation = VALUES(explanation),
+        media_type = VALUES(media_type),
+        url = VALUES(url),
+        hdurl = VALUES(hdurl),
+        service_version = VALUES(service_version),
+        copyright = VALUES(copyright)
     `, tableName)
 
 	_, err = db.Exec(
