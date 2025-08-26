@@ -8,13 +8,62 @@ import (
 	"time"
 
 	"github.com/TWolfis/goapod"
-	_ "github.com/go-sql-driver/mysql" // Import MySQL driver for side effects
 	"gopkg.in/yaml.v3"
 )
 
 const (
 	FIRST_DATE = "1995-06-16" // First date of APOD
 )
+
+// Database enum type
+type Database int
+
+const (
+	MySQL Database = iota
+	PostgreSQL
+)
+
+func (d Database) String() string {
+	switch d {
+	case MySQL:
+		return "MySQL"
+	case PostgreSQL:
+		return "PostgreSQL"
+	default:
+		return "Unknown"
+	}
+}
+
+// ParseDatabase converts string → Database
+func ParseDatabase(s string) (Database, error) {
+	switch strings.ToLower(s) {
+	case "mysql":
+		return MySQL, nil
+	case "postgresql", "postgres", "pg":
+		return PostgreSQL, nil
+	default:
+		return -1, fmt.Errorf("unsupported database: %s", s)
+	}
+}
+
+// For integration with `flag`
+type dbFlag struct{ db *Database }
+
+func (f *dbFlag) String() string {
+	if f.db == nil {
+		return ""
+	}
+	return f.db.String()
+}
+
+func (f *dbFlag) Set(s string) error {
+	parsed, err := ParseDatabase(s)
+	if err != nil {
+		return err
+	}
+	*f.db = parsed
+	return nil
+}
 
 // Custom usage function for better help formatting
 func init() {
@@ -51,13 +100,14 @@ ENVIRONMENT VARIABLES:
 	flag.StringVar(&opts.Enddate, "ed", "", "end date for APOD range in format YYYY-MM-DD")
 	flag.StringVar(&opts.ApiKey, "api-key", "", "NASA API key for APOD service")
 
-	flag.BoolVar(&opts.MySQL, "mysql", false, "save to MySQL database")
-	flag.StringVar(&opts.MySQLUser, "mysql-user", "root", "MySQL username")
-	flag.StringVar(&opts.MySQLPassword, "mysql-pass", "", "MySQL password")
-	flag.StringVar(&opts.MySQLHost, "mysql-host", "localhost", "MySQL hostname")
-	flag.StringVar(&opts.MySQLPort, "mysql-port", "3306", "MySQL port")
-	flag.StringVar(&opts.MySQLDatabase, "mysql-db", "nasa", "MySQL database name")
-	flag.StringVar(&opts.MySQLTable, "mysql-table", "apod", "MySQL table name")
+	flag.BoolVar(&opts.Db, "db", false, "save to database (MySQL or PostgreSQL)")
+	flag.StringVar(&opts.DbType, "db-type", "mysql", "database type: mysql or postgresql")
+	flag.StringVar(&opts.DbUser, "db-user", "root", "database username")
+	flag.StringVar(&opts.DbPassword, "db-pass", "", "database password")
+	flag.StringVar(&opts.DbHost, "db-host", "localhost", "database hostname")
+	flag.StringVar(&opts.DbPort, "db-port", "3306", "database port")
+	flag.StringVar(&opts.DbName, "db-name", "nasa", "database name")
+	flag.StringVar(&opts.DbTable, "db-table", "apod", "database table name")
 
 	flag.BoolVar(&everyting, "everything", false, "fetch everything")
 	flag.BoolVar(&saveToYaml, "save-yaml", false, "save options to YAML file")
@@ -85,13 +135,14 @@ type Options struct {
 	Hdurl     bool   `yaml:"hdurl"`
 	ApiKey    string `yaml:"apiKey"`
 
-	MySQL         bool   `yaml:"mysql"`
-	MySQLPassword string `yaml:"mysqlPassword"`
-	MySQLDatabase string `yaml:"mysqlDatabase"`
-	MySQLTable    string `yaml:"mysqlTable"`
-	MySQLUser     string `yaml:"mysqlUser"`
-	MySQLHost     string `yaml:"mysqlHost"`
-	MySQLPort     string `yaml:"mysqlPort"`
+	Db         bool   `yaml:"db"`
+	DbType     string `yaml:"dbType"`
+	DbUser     string `yaml:"dbUser"`
+	DbPassword string `yaml:"dbPassword"`
+	DbHost     string `yaml:"dbHost"`
+	DbPort     string `yaml:"dbPort"`
+	DbName     string `yaml:"dbName"`
+	DbTable    string `yaml:"dbTable"`
 }
 
 func SetOptionsFromFile(filePath string) (*Options, error) {
@@ -154,10 +205,11 @@ func Everything(opts *Options, a *goapod.Apod) error {
 				return fmt.Errorf("error downloading image for range %s to %s: %w", startDate, endDate, err)
 			}
 		}
-		if opts.MySQL {
-			err := SaveToMySQL(a, opts)
+
+		if opts.Db {
+			err := SaveToDB(a, opts)
 			if err != nil {
-				return fmt.Errorf("error saving to MySQL for range %s to %s: %w", startDate, endDate, err)
+				return fmt.Errorf("error saving to %s for range %s to %s: %w", opts.DbType, startDate, endDate, err)
 			}
 		}
 		fmt.Printf("APOD for range %s to %s processed successfully.\n", startDate, endDate)
@@ -207,27 +259,49 @@ func SaveImage(a *goapod.Apod, dstFile string, hdurl bool) error {
 	return nil
 }
 
-func SaveToMySQL(a *goapod.Apod, opts *Options) error {
-	if opts.MySQLPassword == "" {
-		opts.MySQLPassword = os.Getenv("MYSQL_PASSWORD")
-
-		if opts.MySQLPassword == "" {
-			fmt.Println("MySQL password not set. Please set the MYSQL_PASSWORD environment variable or flag.")
-			return fmt.Errorf("MySQL password not set")
+func SaveToDB(a *goapod.Apod, opts *Options) error {
+	// Set password from env if not provided
+	if opts.DbPassword == "" {
+		switch opts.DbType {
+		case "mysql":
+			opts.DbPassword = os.Getenv("MYSQL_PASSWORD")
+		case "postgresql":
+			opts.DbPassword = os.Getenv("POSTGRES_PASSWORD")
 		}
 	}
 
-	// Create MySQL connection string
-	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s",
-		opts.MySQLUser, opts.MySQLPassword, opts.MySQLHost, opts.MySQLPort, opts.MySQLDatabase)
+	var dsn string
+	switch opts.DbType {
+	case "mysql":
+		dsn = fmt.Sprintf("%s:%s@tcp(%s:%s)/%s",
+			opts.DbUser, opts.DbPassword, opts.DbHost, opts.DbPort, opts.DbName)
+	case "postgresql":
+		dsn = fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+			opts.DbHost, opts.DbPort, opts.DbUser, opts.DbPassword, opts.DbName)
+	default:
+		return fmt.Errorf("unsupported database type: %s", opts.DbType)
+	}
 
 	if len(a.Responses) == 0 {
-		return a.Response.SaveToMySQL(dsn, opts.MySQLTable)
+		switch opts.DbType {
+		case "mysql":
+			return a.Response.SaveToMySQL(dsn, opts.DbTable)
+		case "postgresql":
+			return a.Response.SaveToPostgreSQL(dsn, opts.DbTable)
+		}
 	} else if len(a.Responses) > 1 {
 		for _, ar := range a.Responses {
-			err := ar.SaveToMySQL(dsn, opts.MySQLTable)
-			if err != nil {
-				return err
+			switch opts.DbType {
+			case "mysql":
+				err := ar.SaveToMySQL(dsn, opts.DbTable)
+				if err != nil {
+					return err
+				}
+			case "postgresql":
+				err := ar.SaveToPostgreSQL(dsn, opts.DbTable)
+				if err != nil {
+					return err
+				}
 			}
 		}
 	} else {
@@ -309,14 +383,14 @@ func main() {
 		fmt.Printf("Options saved to %s\n", yamlFile)
 	}
 
-	// save to MySQL
-	if opts.MySQL {
-		err := SaveToMySQL(&a, &opts)
+	// save to DB
+	if opts.Db {
+		err := SaveToDB(&a, &opts)
 		if err != nil {
-			fmt.Println("Error saving to MySQL:", err)
+			fmt.Println("Error saving to database:", err)
 			os.Exit(1)
 		}
-		fmt.Println("APOD saved to MySQL successfully.")
+		fmt.Println("APOD saved to database successfully.")
 	}
 
 }

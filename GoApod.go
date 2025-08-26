@@ -9,6 +9,9 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+
+	_ "github.com/go-sql-driver/mysql" // MySQL driver
+	_ "github.com/lib/pq"              // PostgreSQL driver
 )
 
 // Apod contains the variables associated with the APOD API
@@ -21,17 +24,6 @@ type Apod struct {
 	Thumbs    bool   `json:"thumbs"`     // Thumbs Return the URL of video thumbnail. If an Apod is not a video, this parameter is ignored, defaults to false
 	Response  ApodResponse
 	Responses []ApodResponse
-}
-
-// ApodResponse holds the response JSON object received by a successful call to the APOD API
-type ApodResponse struct {
-	Date           string `json:"date"`
-	Explanation    string `json:"explanation"`
-	Hdurl          string `json:"hdurl"`
-	MediaType      string `json:"media_type"`
-	ServiceVersion string `json:"service_version"`
-	Title          string `json:"title"`
-	URL            string `json:"url"`
 }
 
 // composeQuery creates a query from a struct by marshalling it to json
@@ -119,6 +111,22 @@ func (a *Apod) Fetch() error {
 	return err
 }
 
+// ApodResponse holds the response JSON object received by a successful call to the APOD API
+type ApodResponse struct {
+	Date           string `json:"date"`
+	Explanation    string `json:"explanation"`
+	Hdurl          string `json:"hdurl"`
+	MediaType      string `json:"media_type"`
+	ServiceVersion string `json:"service_version"`
+	Title          string `json:"title"`
+	URL            string `json:"url"`
+}
+
+func (a *ApodResponse) String() string {
+	return fmt.Sprintf("Date: %s\nTitle: %s\nExplanation: %s\nMedia Type: %s\nURL: %s\nHD URL: %s\nService Version: %s\n",
+		a.Date, a.Title, a.Explanation, a.MediaType, a.URL, a.Hdurl, a.ServiceVersion)
+}
+
 // FetchImage downloads the Apod Image in either hd or normal definition
 // if hdurl is set but not available the function will default to url
 func (a *ApodResponse) FetchImage(hdurl bool) ([]byte, error) {
@@ -170,6 +178,51 @@ func (a *ApodResponse) SaveToMySQL(dsn, tableName string) error {
         service_version = VALUES(service_version),
         copyright = VALUES(copyright)
     `, tableName)
+
+	_, err = db.Exec(
+		query,
+		a.Date,
+		a.Title,
+		a.Explanation,
+		a.MediaType,
+		a.URL,
+		a.Hdurl,
+		a.ServiceVersion,
+		sql.NullString{String: "", Valid: false}, // Copyright: optional
+	)
+
+	if err != nil {
+		log.Printf("Failed to insert/update APOD %s: %v\n", a.Date, err)
+	}
+
+	return err
+}
+
+func (a *ApodResponse) SaveToPostgreSQL(dsn, table string) error {
+	db, err := sql.Open("postgres", dsn)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	// Test the connection
+	if err = db.Ping(); err != nil {
+		return err
+	}
+
+	query := fmt.Sprintf(`
+    INSERT INTO %s (
+        apod_date, title, explanation, media_type, url, hdurl, service_version, copyright
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    ON CONFLICT (apod_date) DO UPDATE SET
+        title = EXCLUDED.title,
+        explanation = EXCLUDED.explanation,
+        media_type = EXCLUDED.media_type,
+        url = EXCLUDED.url,
+        hdurl = EXCLUDED.hdurl,
+        service_version = EXCLUDED.service_version,
+        copyright = EXCLUDED.copyright
+    `, table)
 
 	_, err = db.Exec(
 		query,
