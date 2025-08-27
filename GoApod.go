@@ -11,7 +11,7 @@ import (
 	"strconv"
 
 	_ "github.com/go-sql-driver/mysql" // MySQL driver
-	_ "github.com/lib/pq"              // PostgreSQL driver
+	_ "github.com/jackc/pgx/v5/stdlib" // PostgreSQL driver
 )
 
 // Apod contains the variables associated with the APOD API
@@ -199,7 +199,7 @@ func (a *ApodResponse) SaveToMySQL(dsn, tableName string) error {
 }
 
 func (a *ApodResponse) SaveToPostgreSQL(dsn, table string) error {
-	db, err := sql.Open("postgres", dsn)
+	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return err
 	}
