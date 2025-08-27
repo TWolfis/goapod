@@ -1,2 +1,7 @@
 # ignore executables
-afetch
+cmd/afetch/bin
+
+go.sum
+*.yaml
+
+Makefile

@@ -1,0 +1,21 @@
+version: "3.9"
+
+services:
+  astrodb:
+    image: mysql:latest
+    restart: always
+    ports:
+      - 3306:3306
+    volumes:
+      - mysql-vol:/var/lib/mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+    networks:
+      - apodnet
+
+volumes:
+  mysql-vol:
+
+networks:
+  apodnet:
+    driver: bridge

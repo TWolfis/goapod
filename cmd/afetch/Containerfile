@@ -1,0 +1,24 @@
+FROM --platform=arm64 golang:tip-alpine
+LABEL maintainer="twolfis"
+LABEL description="A tool to fetch NASA's Astronomy Picture of the Day (APOD) and store it in a MySQL database."
+
+WORKDIR /app/
+COPY ../.. .
+
+WORKDIR /app/cmd/afetch/
+
+RUN go mod tidy && \
+    go build -o afetch .
+
+# MySQL configuration environment variables
+ENV MYSQL_USER=root
+ENV MYSQL_PASSWORD=
+ENV MYSQL_HOST=localhost
+ENV MYSQL_PORT=3306
+ENV MYSQL_DATABASE=nasa
+ENV MYSQL_TABLE=apod
+
+# NASA API key environment variable
+ENV NASA_API_KEY=DEMO_KEY
+
+CMD ./afetch --mysql --mysql-user "$MYSQL_USER" --mysql-host "$MYSQL_HOST" --mysql-port "$MYSQL_PORT" --mysql-db "$MYSQL_DATABASE" --mysql-table "$MYSQL_TABLE" --api-key "$NASA_API_KEY"
