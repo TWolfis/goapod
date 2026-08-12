@@ -1,0 +1,42 @@
+---
+# Gitea workflow to build the project using a command line tool.
+name: Build Apod Go-Package
+run-name: ${{ gitea.actor }} is building the Apod Go-Package 🚀
+on: [push]
+
+jobs:
+  Build-Apod-Go-Package:
+    env:
+      GIT_SSL_NO_VERIFY: "true"
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "🎉 The job was automatically triggered by a ${{ gitea.event_name }} event."
+      - run: echo "🐧 This job is now running on a ${{ runner.os }} server hosted by Gitea!"
+      - run: echo "🔎 The name of your branch is ${{ gitea.ref }} and your repository is ${{ gitea.repository }}."
+      - name: Check out repository code
+        uses: actions/checkout@v4
+      - run: echo "💡 The ${{ gitea.repository }} repository has been cloned to the runner."
+      - run: echo "🖥️ The workflow is now ready to build the Apod Go-Package on the runner."
+      - name: Build Apod Go-Package
+        working-directory: cmd/afetch
+        run: |
+          go build ./...
+      - name: Set package version
+        run: |
+          echo "PKG_VERSION=v0.0.0-$(date -u +%Y%m%d%H%M%S)-$(echo ${{ gitea.sha }} | cut -c1-7)" >> "$GITEA_ENV"
+      - name: Package Go module
+        working-directory: cmd/afetch
+        run: |
+          MODULE=afetch
+          STAGE="/tmp/pkg/${MODULE}@${PKG_VERSION}"
+          mkdir -p "$STAGE"
+          cp -r . "$STAGE"
+          rm -rf "$STAGE/bin" "$STAGE/.git"
+          (cd /tmp/pkg && zip -r "${MODULE}@${PKG_VERSION}.zip" "${MODULE}@${PKG_VERSION}")
+      - name: Publish to Gitea Go package registry
+        run: |
+          MODULE=afetch
+          curl --fail --user "${{ gitea.actor }}:${{ secrets.PACKAGE_SECRET }}" \
+            --upload-file "/tmp/pkg/${MODULE}@${PKG_VERSION}.zip" \
+            "${{ gitea.server_url }}/api/packages/${{ gitea.repository_owner }}/go/upload"
+      - run: echo "🍏 This job's status is ${{ job.status }}."
