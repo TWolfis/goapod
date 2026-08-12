@@ -4,6 +4,8 @@ on: [push]
 
 jobs:
   Explore-Gitea-Actions:
+    env:
+      GIT_SSL_NO_VERIFY: "true"
     runs-on: ubuntu-latest
     steps:
       - run: echo "🎉 The job was automatically triggered by a ${{ gitea.event_name }} event."
