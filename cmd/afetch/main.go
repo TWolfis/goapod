@@ -12,11 +12,11 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const PROGRAM_NAME = "afetch"
+const ProgramName = "afetch"
 
 // Global variables for flags
 var (
-	opts = Options{ApiKey: &goapod.ApodAPIKey{}}
+	opts = Options{APIKey: &goapod.ApodAPIKey{}}
 	help bool
 )
 
@@ -30,28 +30,35 @@ func (d *DatabaseURLFlag) Set(value string) error {
 	if value == "" {
 
 		// try to get the database connection string from the environment variable
-		value, exists := os.LookupEnv("DATABASE_URL")
-		if !exists || value == "" {
+		envValue, exists := os.LookupEnv("DATABASE_URL")
+		if !exists || envValue == "" {
 			return errors.New("database connection string cannot be empty")
 		}
+		value = envValue
 	}
 	*d = DatabaseURLFlag(value)
 	return nil
 }
 
 type Options struct {
-	DatabaseUrl DatabaseURLFlag
+	DatabaseURL DatabaseURLFlag
 	Date        goapod.ApodDate
 	DateRange   goapod.ApodDateRange
 	Count       goapod.ApodCount
 	Concurrent  int
+	BatchSize   int
 	Thumbs      bool
 	Download    bool
 	Hdurl       bool
-	ApiKey      *goapod.ApodAPIKey
+	APIKey      *goapod.ApodAPIKey
 
-	conn *pgx.Conn
+	conn     *pgx.Conn
+	dbBuffer []goapod.ApodResponse
 }
+
+// dbBatchSize is the number of responses buffered before WriteToDB flushes
+// them as a single multi-row INSERT, instead of one round trip per response.
+const dbBatchSize = 100
 
 // apodFetchFunc fetches the responses for a single (non-batched) request.
 type apodFetchFunc func(a *goapod.Apod) ([]goapod.ApodResponse, error)
@@ -60,29 +67,35 @@ type apodFetchFunc func(a *goapod.Apod) ([]goapod.ApodResponse, error)
 // optionally downloading) each response as it arrives. Date, DateRange, and
 // Count are mutually exclusive, so exactly one of the cases below applies.
 func (o *Options) Fetch() error {
-	a := goapod.NewApod(o.ApiKey, o.Date, o.DateRange, o.Count, o.Thumbs)
-	if o.DatabaseUrl != "" {
-		if err := o.InitDbConn(); err != nil {
+	a := goapod.NewApod(o.APIKey, o.Date, o.DateRange, o.Count, o.Thumbs)
+	if o.DatabaseURL != "" {
+		if err := o.InitDBConn(); err != nil {
 			return fmt.Errorf("failed to initialize database connection: %w", err)
 		}
 		defer o.conn.Close(context.Background())
 	}
 
+	var err error
 	switch {
 	case !o.Date.IsZero():
-		return o.fetch(a, o.Date.Fetch)
-	case o.DateRange.Len() > goapod.MAXIMUM_APOD_RANGE:
-		return o.fetchBatched(a)
+		err = o.fetch(a, o.Date.Fetch)
+	case o.DateRange.Len() > goapod.MaximumApodRange:
+		err = o.fetchBatched(a)
 	case !o.DateRange.StartDate.IsZero():
-		return o.fetch(a, o.DateRange.Fetch)
+		err = o.fetch(a, o.DateRange.Fetch)
 	default:
-		return o.fetch(a, o.Count.Fetch)
+		err = o.fetch(a, o.Count.Fetch)
 	}
+
+	if o.conn != nil {
+		o.flushDB()
+	}
+	return err
 }
 
-func (o *Options) InitDbConn() error {
+func (o *Options) InitDBConn() error {
 	var conn *pgx.Conn
-	conn, err := pgx.Connect(context.Background(), string(o.DatabaseUrl))
+	conn, err := pgx.Connect(context.Background(), string(o.DatabaseURL))
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -90,14 +103,46 @@ func (o *Options) InitDbConn() error {
 	return nil
 }
 
-func (o *Options) WriteToDb(resp goapod.ApodResponse) error {
-	_, err := o.conn.Exec(context.Background(),
-		`INSERT INTO apod (apod_date, title, explanation, media_type, url, hdurl, service_version) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		resp.Date, resp.Title, resp.Explanation, resp.MediaType, resp.URL, resp.Hdurl, resp.ServiceVersion)
-	if err != nil {
+// WriteToDB inserts a batch of responses in a single multi-row INSERT
+// instead of one round trip per response. Rows whose apod_date already
+// exists are silently skipped, so re-fetching an overlapping range is safe.
+func (o *Options) WriteToDB(resps []goapod.ApodResponse) error {
+	if len(resps) == 0 {
+		return nil
+	}
+
+	var sql strings.Builder
+	sql.WriteString(`INSERT INTO apod (apod_date, title, explanation, media_type, url, hdurl, service_version) VALUES `)
+
+	args := make([]any, 0, len(resps)*7)
+	for i, resp := range resps {
+		if i > 0 {
+			sql.WriteString(", ")
+		}
+		n := i * 7
+		fmt.Fprintf(&sql, "($%d, $%d, $%d, $%d, $%d, $%d, $%d)", n+1, n+2, n+3, n+4, n+5, n+6, n+7)
+		args = append(args, resp.Date, resp.Title, resp.Explanation, resp.MediaType, resp.URL, resp.Hdurl, resp.ServiceVersion)
+	}
+	sql.WriteString(" ON CONFLICT (apod_date) DO NOTHING")
+
+	if _, err := o.conn.Exec(context.Background(), sql.String(), args...); err != nil {
 		return fmt.Errorf("failed to insert APOD data into database: %w", err)
 	}
 	return nil
+}
+
+// flushDB writes the buffered responses to the database and clears the
+// buffer, regardless of how many are currently pending.
+func (o *Options) flushDB() {
+	if len(o.dbBuffer) == 0 {
+		return
+	}
+	if err := o.WriteToDB(o.dbBuffer); err != nil {
+		fmt.Println("Error writing to database:", err)
+	} else {
+		fmt.Printf("%d APOD row(s) written to database successfully.\n", len(o.dbBuffer))
+	}
+	o.dbBuffer = o.dbBuffer[:0]
 }
 
 // fetch runs a single request and handles every response it returns.
@@ -109,7 +154,6 @@ func (o *Options) fetch(a *goapod.Apod, do apodFetchFunc) error {
 
 	for _, resp := range responses {
 		o.handle(resp)
-
 	}
 	return nil
 }
@@ -117,7 +161,7 @@ func (o *Options) fetch(a *goapod.Apod, do apodFetchFunc) error {
 // fetchBatched fetches a date range too large for a single request in
 // concurrent batches, handling each response as it streams in.
 func (o *Options) fetchBatched(a *goapod.Apod) error {
-	respChan, errChan := o.DateRange.FetchinBatches(context.Background(), a, o.Concurrent)
+	respChan, errChan := o.DateRange.FetchinBatches(context.Background(), a, o.Concurrent, o.BatchSize)
 
 	var errs []error
 	for respChan != nil || errChan != nil {
@@ -142,15 +186,14 @@ func (o *Options) fetchBatched(a *goapod.Apod) error {
 
 // handle prints a single APOD response and downloads its image if requested.
 func (o *Options) handle(resp goapod.ApodResponse) {
-
 	fmt.Println(o.String(resp))
 
-	// If a database connection is provided, write the response to the database
+	// If a database connection is provided, buffer the response and flush
+	// once a full batch has accumulated (Fetch flushes any remainder).
 	if o.conn != nil {
-		if err := o.WriteToDb(resp); err != nil {
-			fmt.Println("Error writing to database:", err)
-		} else {
-			fmt.Println("APOD data written to database successfully.")
+		o.dbBuffer = append(o.dbBuffer, resp)
+		if len(o.dbBuffer) >= dbBatchSize {
+			o.flushDB()
 		}
 	}
 
@@ -168,7 +211,7 @@ func (o *Options) String(a goapod.ApodResponse) string {
 	return a.String()
 }
 
-// SaveImage saves the APOD image to the specified destination file
+// DownloadImage saves the APOD image to the current directory, named after its title.
 func (o *Options) DownloadImage(r goapod.ApodResponse) error {
 	f := strings.ToLower(r.Title) + ".jpg"
 	f = strings.ReplaceAll(f, " ", "_")
@@ -177,7 +220,7 @@ func (o *Options) DownloadImage(r goapod.ApodResponse) error {
 		return err
 	}
 
-	os.WriteFile(f, img, 0644)
+	os.WriteFile(f, img, 0o644)
 	return nil
 }
 
@@ -194,7 +237,7 @@ USAGE:
     %[1]s [FLAGS]
 
 FLAGS:
-`, PROGRAM_NAME)
+`, ProgramName)
 		flag.PrintDefaults()
 		fmt.Fprintf(flag.CommandLine.Output(), `
 EXAMPLES:
@@ -203,14 +246,19 @@ EXAMPLES:
     %[1]s -dr "2023-07-01, 2023-07-07"     # Get APOD for a date range
     %[1]s -c 5                             # Get 5 random APODs
     %[1]s -d 2023-07-20 -dl -hd            # Download HD image for a specific date
-	%[1]s -db "postgres://user:pass@localhost:5432/apod"  # Save APOD data to a PostgreSQL database
+    %[1]s -db "postgres://user:pass@localhost:5432/apod"  # Save APOD data to a PostgreSQL database
+    %[1]s -dr "1995-06-16, today" -concurrent 20 -batch-size 15 -db "..."  # Fetch full history, streaming results as small chunks complete
 
 ENVIRONMENT VARIABLES:
-    NASA_API_KEY               NASA API key for APOD service (alternative to -api-key flag)
-	DATABASE_URL               PostgreSQL database connection string (alternative to -db flag)
+    NASA_API_KEY    NASA API key for APOD service (alternative to -api-key flag)
+    DATABASE_URL    PostgreSQL database connection string (alternative to -db flag)
 
-`, PROGRAM_NAME)
+`, ProgramName)
 	}
+
+	// Seed the default API key ($NASA_API_KEY, falling back to "DEMO_KEY") up
+	// front, since flag.Var only calls Set when -api-key is actually passed.
+	opts.APIKey.Set("")
 
 	// Define all flags
 	flag.BoolVar(&opts.Hdurl, "hd", true, "use the HD image URL when downloading")
@@ -218,16 +266,16 @@ ENVIRONMENT VARIABLES:
 	flag.Var(&opts.Date, "d", `date for APOD, format YYYY-MM-DD (or "today")`)
 	flag.Var(&opts.DateRange, "dr", `date range for APOD, format "YYYY-MM-DD, YYYY-MM-DD"`)
 	flag.Var(&opts.Count, "c", "number of random APODs to fetch")
-	flag.IntVar(&opts.Concurrent, "concurrent", 2, "number of concurrent requests to make")
+	flag.IntVar(&opts.Concurrent, "concurrent", 10, "number of concurrent requests to make when batching a date range")
+	flag.IntVar(&opts.BatchSize, "batch-size", 30, fmt.Sprintf("days per API request when batching a date range (max %d); smaller values stream results back sooner at the cost of more requests", goapod.MaximumApodRange))
 	flag.BoolVar(&opts.Thumbs, "thumbs", false, "return video thumbnail URLs instead of the video URL")
-	flag.Var((&opts.DatabaseUrl), "db", "PostgreSQL database connection string (or set DATABASE_URL environment variable)")
-	flag.Var(opts.ApiKey, "api-key", "NASA API key for APOD service (defaults to $NASA_API_KEY, then DEMO_KEY)")
+	flag.Var((&opts.DatabaseURL), "db", "PostgreSQL database connection string (or set DATABASE_URL environment variable)")
+	flag.Var(opts.APIKey, "api-key", "NASA API key for APOD service (defaults to $NASA_API_KEY, then DEMO_KEY)")
 
 	flag.BoolVar(&help, "h", false, "show this help message")
 }
 
 func main() {
-
 	flag.Parse()
 
 	if help {
@@ -236,7 +284,7 @@ func main() {
 	}
 
 	// Count and Database URL are mutually exclusive; if both are set, print an error and exit
-	if opts.Count > 0 && opts.DatabaseUrl != "" {
+	if opts.Count > 0 && opts.DatabaseURL != "" {
 		fmt.Println("Error: -c and -db flags are mutually exclusive.")
 		os.Exit(1)
 	}

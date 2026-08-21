@@ -3,10 +3,11 @@
 //
 // An Apod is fetched by a single date (ApodDate), a date range
 // (ApodDateRange), or a batch of random dates (ApodCount) — these are
-// mutually exclusive. Build one with NewApod, then call Fetch on the
-// relevant field (Date, DateRange, or Count). Date ranges longer than
-// MAXIMUM_APOD_RANGE must use ApodDateRange.FetchinBatches instead of
-// ApodDateRange.Fetch.
+// mutually exclusive. Build one with New (defaults, fill in the rest
+// yourself) or NewApod (validates a specific combination up front), then
+// call Fetch on the relevant field (Date, DateRange, or Count). Date ranges
+// longer than MaximumApodRange must use ApodDateRange.FetchinBatches
+// instead of ApodDateRange.Fetch.
 package goapod
 
 import (
@@ -25,25 +26,39 @@ import (
 )
 
 const (
-	FIRST_DATE  = "1995-06-16" // First date of APOD
-	DATE_FORMAT = "2006-01-02" // Date format for APOD
+	FirstDate  = "1995-06-16" // First date of APOD
+	DateFormat = "2006-01-02" // Date format for APOD
 
-	MAXIMUM_APOD_RANGE = 300  // Maximum number of days that can be requested in a single API call
-	DEMO_KEY_LIMIT     = 30   // Hourly rate limit for the default "DEMO_KEY" API key
-	API_KEY_LIMIT      = 1000 // Hourly rate limit for a personal API key
+	MaximumApodRange = 300  // Maximum number of days that can be requested in a single API call
+	DemoKeyLimit     = 30   // Hourly rate limit for the default "DEMO_KEY" API key
+	APIKeyLimit      = 1000 // Hourly rate limit for a personal API key
 
-	BASE_URL = "https://api.nasa.gov/planetary/apod" // Base URL for the APOD API
+	BaseURL = "https://api.nasa.gov/planetary/apod" // Base URL for the APOD API
 )
 
 // Apod contains the variables associated with the APOD API
 type Apod struct {
-	ApiKey    *ApodAPIKey   // ApiKey is the users personal ApiKey defaults to "DEMO_KEY"
+	APIKey    *ApodAPIKey   // APIKey is the user's personal API key, defaults to "DEMO_KEY"
 	Date      ApodDate      `json:"date"`       // Date of the Apod image to retrieve defaults to today
 	DateRange ApodDateRange `json:"date_range"` // Range of date ranges, when requesting for a range of dates. Cannot be used with Date, defaults to none
 	Count     ApodCount     `json:"count"`      // Count If this is specified then count randomly chosen images will be returned. Cannot be used with date or StartDate and EndDate, defaults to none
 	Thumbs    bool          `json:"thumbs"`     // Thumbs Return the URL of video thumbnail. If an Apod is not a video, this parameter is ignored, defaults to false
 	Response  ApodResponse
 	Responses []ApodResponse
+}
+
+// New returns an Apod with a default API key (falls back to $NASA_API_KEY,
+// then "DEMO_KEY") and Date, DateRange, and Count left at their zero values.
+// Set exactly one of them (e.g. a.Date.Set("2023-07-20")) and call Fetch on
+// that field. Use NewApod instead when you already have a specific date,
+// date range, or count to validate up front.
+func New() *Apod {
+	apiKey := &ApodAPIKey{}
+	apiKey.Set("")
+
+	return &Apod{
+		APIKey: apiKey,
+	}
 }
 
 // NewApod validates the given combination of date, date range, and count
@@ -71,7 +86,7 @@ func NewApod(apiKey *ApodAPIKey, date ApodDate, dateRange ApodDateRange, count A
 	}
 
 	return &Apod{
-		ApiKey:    apiKey,
+		APIKey:    apiKey,
 		Date:      date,
 		DateRange: dateRange,
 		Count:     count,
@@ -87,12 +102,12 @@ type apodQuery struct {
 }
 
 func (a *Apod) composeQuery(q apodQuery) (*http.Request, error) {
-	req, err := http.NewRequest("GET", BASE_URL, nil)
+	req, err := http.NewRequest("GET", BaseURL, nil)
 	if err != nil {
 		return nil, err
 	}
 	query := req.URL.Query()
-	query.Add("api_key", a.ApiKey.Key)
+	query.Add("api_key", a.APIKey.Key)
 
 	switch {
 	case q.date != nil:
@@ -125,10 +140,10 @@ func (a *Apod) doFetch(q apodQuery) ([]ApodResponse, error) {
 	}
 	defer resp.Body.Close()
 
-	a.ApiKey.UpdateRateLimitInfo(resp) // now needs a lock — see below
+	a.APIKey.UpdateRateLimitInfo(resp) // now needs a lock — see below
 
-	if a.ApiKey.RateLimitExceeded() { // ditto
-		return nil, errors.New("API rate limit exceeded. Please try again later.")
+	if a.APIKey.RateLimitExceeded() { // ditto
+		return nil, errors.New("API rate limit exceeded, try again later")
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("API request failed with status code: %d", resp.StatusCode)
@@ -159,9 +174,9 @@ func getTodayDate() ApodDate {
 	return ApodDate{Time: time.Now()}
 }
 
-// firstApodDate returns the earliest valid APOD date (FIRST_DATE) as an ApodDate.
+// firstApodDate returns the earliest valid APOD date (FirstDate) as an ApodDate.
 func firstApodDate() ApodDate {
-	t, _ := time.Parse(DATE_FORMAT, FIRST_DATE)
+	t, _ := time.Parse(DateFormat, FirstDate)
 	return ApodDate{Time: t}
 }
 
@@ -172,7 +187,7 @@ type ApodDate struct {
 
 // String returns the string representation of the date
 func (d ApodDate) String() string {
-	return d.Format(DATE_FORMAT)
+	return d.Format(DateFormat)
 }
 
 // Set parses and sets the date value
@@ -183,13 +198,13 @@ func (d *ApodDate) Set(value string) error {
 		return nil
 	}
 
-	t, err := time.Parse(DATE_FORMAT, value)
+	t, err := time.Parse(DateFormat, value)
 	if err != nil {
 		return fmt.Errorf("invalid date format: %s, expected YYYY-MM-DD", value)
 	}
 
 	if t.Before(firstApodDate().Time) {
-		return fmt.Errorf("date cannot be before %s", FIRST_DATE)
+		return fmt.Errorf("date cannot be before %s", FirstDate)
 	}
 
 	d.Time = t
@@ -284,21 +299,27 @@ func (dr *ApodDateRange) chunk(size int) []ApodDateRange {
 }
 
 // Fetch retrieves the APOD for every date in the range in a single API
-// call. For ranges longer than MAXIMUM_APOD_RANGE, use FetchinBatches
+// call. For ranges longer than MaximumApodRange, use FetchinBatches
 // instead.
 func (dr *ApodDateRange) Fetch(a *Apod) ([]ApodResponse, error) {
 	return a.doFetch(apodQuery{dateRange: dr})
 }
 
 // FetchinBatches fetches a date range too large for a single API call by
-// splitting it into chunks of at most MAXIMUM_APOD_RANGE days and fetching
-// up to concurrent chunks at a time. Responses and errors are delivered on
-// the returned channels as they complete; both channels are closed once
-// every chunk has been processed.
-func (dr *ApodDateRange) FetchinBatches(ctx context.Context, a *Apod, concurrent int) (<-chan ApodResponse, <-chan error) {
+// splitting it into chunks of batchSize days (each chunk is one API call,
+// clamped to at most MaximumApodRange) and fetching up to concurrent
+// chunks at a time. A response isn't visible on the returned channel until
+// its whole chunk's API call completes, so a smaller batchSize trades more
+// total requests for more frequent, incremental results instead of long
+// silences while a large chunk is in flight. Responses and errors are
+// delivered on the returned channels as they complete; both channels are
+// closed once every chunk has been processed.
+func (dr *ApodDateRange) FetchinBatches(ctx context.Context, a *Apod, concurrent int, batchSize int) (<-chan ApodResponse, <-chan error) {
+	if batchSize <= 0 || batchSize > MaximumApodRange {
+		batchSize = MaximumApodRange
+	}
 
-	// Batch the requests into chunks of 365 days
-	chunks := dr.chunk(MAXIMUM_APOD_RANGE)
+	chunks := dr.chunk(batchSize)
 
 	sem := make(chan struct{}, concurrent)
 	respChan := make(chan ApodResponse, len(chunks))
@@ -344,7 +365,6 @@ func (dr *ApodDateRange) FetchinBatches(ctx context.Context, a *Apod, concurrent
 	}()
 
 	return respChan, errChan
-
 }
 
 // ApodCount is the number of randomly chosen APODs to fetch. It is
@@ -394,15 +414,16 @@ func (k *ApodAPIKey) Set(value string) error {
 	if value == "" {
 		// Fall back to the environment variable; goapod defaults to "DEMO_KEY"
 		// if the key is still empty.
-		value, exists := os.LookupEnv("NASA_API_KEY")
-		if !exists || value == "" {
-			value = "DEMO_KEY"
+		envValue, exists := os.LookupEnv("NASA_API_KEY")
+		if !exists || envValue == "" {
+			envValue = "DEMO_KEY"
 		}
+		value = envValue
 
-		rateLimit = DEMO_KEY_LIMIT
+		rateLimit = DemoKeyLimit
 
 	} else {
-		rateLimit = API_KEY_LIMIT
+		rateLimit = APIKeyLimit
 	}
 
 	k.Key = value
@@ -471,7 +492,7 @@ func (a *ApodResponse) FetchImage(hdurl bool) ([]byte, error) {
 		src = a.URL
 	}
 
-	//make request to src to fetch the file
+	// make request to src to fetch the file
 	resp, err := http.Get(src)
 	if err != nil {
 		return []byte{}, err

@@ -4,7 +4,7 @@ Golang library for fetching NASA's Astronomy Picture of the Day (APOD):
 [api.nasa.gov/planetary/apod](https://api.nasa.gov/planetary/apod).
 
 Fetch a single date, a date range, or a batch of random dates. Date ranges
-longer than `goapod.MAXIMUM_APOD_RANGE` days can be fetched concurrently in
+longer than `goapod.MaximumApodRange` days can be fetched concurrently in
 batches. The repo also includes `afetch`, a CLI built on top of the library.
 
 ## Installation
@@ -15,9 +15,11 @@ go get github.com/TWolfis/goapod
 
 ## Library usage
 
-Every request starts from an `*Apod` built with `NewApod`, then dispatches to
-the matching `Fetch` method. `ApodDate`, `ApodDateRange`, and `ApodCount` are
-mutually exclusive — set only one.
+Every request starts from an `*Apod`, then dispatches to the matching `Fetch`
+method. `ApodDate`, `ApodDateRange`, and `ApodCount` are mutually exclusive —
+set only one. `goapod.New()` returns an `*Apod` with a default API key
+(falls back to `$NASA_API_KEY`, then `"DEMO_KEY"`) and everything else left
+at its zero value, ready to fill in:
 
 ```go
 package main
@@ -30,17 +32,13 @@ import (
 )
 
 func main() {
-    apiKey := &goapod.ApodAPIKey{}
-    apiKey.Set("") // falls back to $NASA_API_KEY, then "DEMO_KEY"
+    a := goapod.New()
 
-    var date goapod.ApodDate
-    if err := date.Set("2023-07-20"); err != nil {
+    if err := a.Date.Set("2023-07-20"); err != nil {
         log.Fatal(err)
     }
 
-    a := goapod.NewApod(apiKey, date, goapod.ApodDateRange{}, 0, false)
-
-    responses, err := date.Fetch(a)
+    responses, err := a.Date.Fetch(a)
     if err != nil {
         log.Fatal(err)
     }
@@ -51,33 +49,36 @@ func main() {
 }
 ```
 
-Fetching a date range works the same way, just set an `ApodDateRange` instead
-and call `Fetch` on it:
+Fetching a date range works the same way, just set `DateRange` instead and
+call `Fetch` on it:
 
 ```go
-var dr goapod.ApodDateRange
-dr.Set("2023-07-01, 2023-07-07") // "YYYY-MM-DD, YYYY-MM-DD"
+a := goapod.New()
+a.DateRange.Set("2023-07-01, 2023-07-07") // "YYYY-MM-DD, YYYY-MM-DD"
 
-a := goapod.NewApod(apiKey, goapod.ApodDate{}, dr, 0, false)
-responses, err := dr.Fetch(a)
+responses, err := a.DateRange.Fetch(a)
 ```
 
-Ranges longer than `goapod.MAXIMUM_APOD_RANGE` days must go through
+Use `NewApod(apiKey, date, dateRange, count, thumbs)` instead of `New()` when
+you already have a specific date, date range, or count and want the
+mutually-exclusive combination validated up front (it panics on conflicting
+fields, e.g. both `date` and `count` set).
+
+Ranges longer than `goapod.MaximumApodRange` days must go through
 `FetchinBatches` instead, which splits the range into chunks and fetches them
 concurrently, streaming results back over channels:
 
 ```go
-respChan, errChan := dr.FetchinBatches(context.Background(), a, 5) // 5 concurrent requests
+respChan, errChan := a.DateRange.FetchinBatches(context.Background(), a, 5, 30) // 5 concurrent requests, 30 days per request
 ```
 
 And fetching a batch of random dates:
 
 ```go
-var count goapod.ApodCount
-count.Set("5")
+a := goapod.New()
+a.Count.Set("5")
 
-a := goapod.NewApod(apiKey, goapod.ApodDate{}, goapod.ApodDateRange{}, count, false)
-responses, err := count.Fetch(a)
+responses, err := a.Count.Fetch(a)
 ```
 
 `ApodAPIKey` also tracks the rate limit reported by NASA's API
