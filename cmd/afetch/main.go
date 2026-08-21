@@ -256,9 +256,11 @@ ENVIRONMENT VARIABLES:
 `, ProgramName)
 	}
 
-	// Seed the default API key ($NASA_API_KEY, falling back to "DEMO_KEY") up
-	// front, since flag.Var only calls Set when -api-key is actually passed.
+	// Seed the default API key ($NASA_API_KEY, falling back to "DEMO_KEY") and
+	// database URL ($DATABASE_URL) up front, since flag.Var only calls Set
+	// when -api-key/-db is actually passed on the command line.
 	opts.APIKey.Set("")
+	opts.DatabaseURL.Set("")
 
 	// Define all flags
 	flag.BoolVar(&opts.Hdurl, "hd", true, "use the HD image URL when downloading")
