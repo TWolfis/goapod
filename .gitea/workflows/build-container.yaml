@@ -1,0 +1,46 @@
+---
+# Gitea workflow to build and push a multi-arch (amd64/arm64) container image.
+name: Build Apod Container Image
+run-name: ${{ gitea.actor }} is building the Apod container image 🚀
+on: [push]
+
+jobs:
+  Build-Apod-Container-Image:
+    env:
+      GIT_SSL_NO_VERIFY: "true"
+    runs-on: golang-latest
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set image tag and registry
+        run: |
+          REGISTRY_HOST=$(echo "${{ gitea.server_url }}" | sed -E 's#^[a-zA-Z]+://##')
+          IMAGE="${REGISTRY_HOST}/${{ gitea.repository_owner }}/goapod"
+          TAG="v0.0.0-$(date -u +%Y%m%d%H%M%S)-$(echo ${{ gitea.sha }} | cut -c1-7)"
+          echo "REGISTRY_HOST=${REGISTRY_HOST}" >> "$GITEA_ENV"
+          echo "IMAGE=${IMAGE}" >> "$GITEA_ENV"
+          echo "TAG=${TAG}" >> "$GITEA_ENV"
+
+      - name: Log in to Gitea container registry
+        run: |
+          echo "${{ secrets.PACKAGE_SECRET }}" | podman login "$REGISTRY_HOST" -u "${{ gitea.actor }}" --password-stdin
+
+      - name: Build multi-arch manifest
+        run: |
+          podman build \
+            --platform linux/amd64,linux/arm64 \
+            --manifest "${IMAGE}:${TAG}" \
+            -f Containerfile .
+
+      - name: Push multi-arch manifest
+        run: |
+          podman manifest push --all "${IMAGE}:${TAG}" "docker://${IMAGE}:${TAG}"
+
+      - name: Tag and push latest
+        if: gitea.ref == 'refs/heads/main'
+        run: |
+          podman tag "${IMAGE}:${TAG}" "${IMAGE}:latest"
+          podman manifest push --all "${IMAGE}:latest" "docker://${IMAGE}:latest"
+
+      - run: echo "🍏 This job's status is ${{ job.status }}."

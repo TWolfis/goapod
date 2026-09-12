@@ -13,6 +13,8 @@ RUN go mod download
 
 COPY cmd/afetch/*.go ./
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o /afetch
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /afetch
 
 CMD ["/afetch"]
