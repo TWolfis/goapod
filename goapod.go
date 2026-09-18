@@ -1,13 +1,22 @@
 // Package goapod is a client for NASA's Astronomy Picture of the Day (APOD)
-// API: https://api.nasa.gov/planetary/apod.
+// "APOD Basic" JSON API served by science.nasa.gov:
+// https://science.nasa.gov/wp-json/wp/v2/apod-basic.
+//
+// The APOD Basic API replaces the retired api.nasa.gov/planetary/apod
+// service. It needs no API key, and it paginates list results at
+// MaxPerPage items per request instead of accepting arbitrarily large date
+// ranges. Dates in request URLs use the legacy YYMMDD code (LegacyDateFormat);
+// dates in responses use YYYY-MM-DD (DateFormat).
 //
 // An Apod is fetched by a single date (ApodDate), a date range
 // (ApodDateRange), or a batch of random dates (ApodCount) — these are
 // mutually exclusive. Build one with New (defaults, fill in the rest
 // yourself) or NewApod (validates a specific combination up front), then
-// call Fetch on the relevant field (Date, DateRange, or Count). Date ranges
-// longer than MaximumApodRange must use ApodDateRange.FetchinBatches
-// instead of ApodDateRange.Fetch.
+// call Fetch on the relevant field (Date, DateRange, or Count). Every Fetch
+// takes a context.Context for cancellation and deadlines.
+// ApodDateRange.Fetch walks every page of a range sequentially;
+// ApodDateRange.FetchinBatches fetches the range concurrently and streams
+// results back over channels.
 package goapod
 
 import (
@@ -15,10 +24,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"iter"
+	"math/rand/v2"
 	"net/http"
-	"os"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,44 +38,46 @@ import (
 )
 
 const (
-	FirstDate  = "1995-06-16" // First date of APOD
-	DateFormat = "2006-01-02" // Date format for APOD
+	FirstDate        = "1995-06-16" // First date of APOD
+	DateFormat       = "2006-01-02" // Date format used in API responses and accepted by ApodDate.Set
+	LegacyDateFormat = "060102"     // Legacy YYMMDD date code used in request URLs and query parameters
 
-	MaximumApodRange = 300  // Maximum number of days that can be requested in a single API call
-	DemoKeyLimit     = 30   // Hourly rate limit for the default "DEMO_KEY" API key
-	APIKeyLimit      = 1000 // Hourly rate limit for a personal API key
+	MaxPerPage       = 25         // Maximum number of results the API returns per request (per_page is capped at this)
+	MaximumApodRange = MaxPerPage // Maximum number of days per request in ApodDateRange.FetchinBatches; a chunk this size always fits on a single page
 
-	BaseURL = "https://api.nasa.gov/planetary/apod" // Base URL for the APOD API
+	BaseURL        = "https://science.nasa.gov/wp-json/wp/v2/apod-basic" // Base URL for the APOD Basic API
+	DefaultTimeout = 60 * time.Second                                    // Timeout of the http.Client created by New
+
+	// RandomConcurrency is the number of single-date requests ApodCount.Fetch
+	// keeps in flight at once. The API has no random endpoint, so random
+	// APODs are emulated with one request per date.
+	RandomConcurrency = 5
 )
 
 // Apod contains the variables associated with the APOD API
 type Apod struct {
-	APIKey    *ApodAPIKey   // APIKey is the user's personal API key, defaults to "DEMO_KEY"
+	Client    *http.Client  // Client used for every request; New sets one with DefaultTimeout, nil falls back to http.DefaultClient
+	BaseURL   string        // BaseURL of the APOD Basic API; New sets it to BaseURL, empty falls back to BaseURL
 	Date      ApodDate      `json:"date"`       // Date of the Apod image to retrieve defaults to today
 	DateRange ApodDateRange `json:"date_range"` // Range of date ranges, when requesting for a range of dates. Cannot be used with Date, defaults to none
 	Count     ApodCount     `json:"count"`      // Count If this is specified then count randomly chosen images will be returned. Cannot be used with date or StartDate and EndDate, defaults to none
-	Thumbs    bool          `json:"thumbs"`     // Thumbs Return the URL of video thumbnail. If an Apod is not a video, this parameter is ignored, defaults to false
-	Response  ApodResponse
-	Responses []ApodResponse
 }
 
-// New returns an Apod with a default API key (falls back to $NASA_API_KEY,
-// then "DEMO_KEY") and Date, DateRange, and Count left at their zero values.
-// Set exactly one of them (e.g. a.Date.Set("2023-07-20")) and call Fetch on
-// that field. Use NewApod instead when you already have a specific date,
-// date range, or count to validate up front.
+// New returns an Apod with a default HTTP client and base URL, and Date,
+// DateRange, and Count left at their zero values. Set exactly one of them
+// (e.g. a.Date.Set("2023-07-20")) and call Fetch on that field. Use NewApod
+// instead when you already have a specific date, date range, or count to
+// validate up front.
 func New() *Apod {
-	apiKey := &ApodAPIKey{}
-	apiKey.Set("")
-
 	return &Apod{
-		APIKey: apiKey,
+		Client:  &http.Client{Timeout: DefaultTimeout},
+		BaseURL: BaseURL,
 	}
 }
 
 // NewApod validates the given combination of date, date range, and count
 // parameters (which are mutually exclusive) and returns a configured Apod.
-func NewApod(apiKey *ApodAPIKey, date ApodDate, dateRange ApodDateRange, count ApodCount, thumbs bool) *Apod {
+func NewApod(date ApodDate, dateRange ApodDateRange, count ApodCount) *Apod {
 	hasDate := !date.IsZero()
 	hasDateRange := !dateRange.StartDate.IsZero() || !dateRange.EndDate.IsZero()
 	hasCount := count > 0
@@ -85,89 +99,136 @@ func NewApod(apiKey *ApodAPIKey, date ApodDate, dateRange ApodDateRange, count A
 		dateRange.StartDate = firstApodDate()
 	}
 
-	return &Apod{
-		APIKey:    apiKey,
-		Date:      date,
-		DateRange: dateRange,
-		Count:     count,
-		Thumbs:    thumbs,
-	}
+	a := New()
+	a.Date = date
+	a.DateRange = dateRange
+	a.Count = count
+	return a
 }
 
-// composeQuery creates a query from a struct by marshalling it to json
-type apodQuery struct {
-	date      *ApodDate
-	dateRange *ApodDateRange
-	count     *ApodCount
+// APIError is an error response from the API, decoded from the WordPress
+// REST error body ({"code": ..., "message": ..., "data": {"status": ...}}).
+type APIError struct {
+	StatusCode int    // HTTP status code of the response
+	Code       string `json:"code"`    // Machine-readable error code, e.g. "apod_basic_not_found" or "rest_invalid_param"
+	Message    string `json:"message"` // Human-readable message
 }
 
-func (a *Apod) composeQuery(q apodQuery) (*http.Request, error) {
-	req, err := http.NewRequest("GET", BaseURL, nil)
-	if err != nil {
-		return nil, err
+// Error implements the error interface.
+func (e *APIError) Error() string {
+	if e.Code == "" {
+		return fmt.Sprintf("API request failed with status code: %d", e.StatusCode)
 	}
-	query := req.URL.Query()
-	query.Add("api_key", a.APIKey.Key)
-
-	switch {
-	case q.date != nil:
-		query.Add("date", q.date.String())
-	case q.dateRange != nil:
-		query.Add("start_date", q.dateRange.StartDate.String())
-		query.Add("end_date", q.dateRange.EndDate.String())
-	case q.count != nil:
-		query.Add("count", q.count.String())
-	default:
-		query.Add("date", getTodayDate().String())
-	}
-	if a.Thumbs {
-		query.Add("thumbs", "true")
-	}
-	req.URL.RawQuery = query.Encode()
-	return req, nil
+	return fmt.Sprintf("API request failed with status code %d: %s (%s)", e.StatusCode, e.Message, e.Code)
 }
 
-func (a *Apod) doFetch(q apodQuery) ([]ApodResponse, error) {
-	req, err := a.composeQuery(q)
-	if err != nil {
-		return nil, err
-	}
+// NotFound reports whether the error means no APOD exists for the requested
+// date (HTTP 404).
+func (e *APIError) NotFound() bool {
+	return e.StatusCode == http.StatusNotFound
+}
 
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
+func (a *Apod) httpClient() *http.Client {
+	if a.Client != nil {
+		return a.Client
+	}
+	return http.DefaultClient
+}
+
+func (a *Apod) baseURL() string {
+	if a.BaseURL != "" {
+		return a.BaseURL
+	}
+	return BaseURL
+}
+
+// get performs a GET request against path (relative to the base URL) with
+// the given query and returns the response body and headers. A non-200
+// response is returned as an *APIError.
+func (a *Apod) get(ctx context.Context, path string, query url.Values) ([]byte, http.Header, error) {
+	u, err := url.Parse(a.baseURL())
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	u.Path = strings.TrimSuffix(u.Path, "/") + path
+	u.RawQuery = query.Encode()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := a.httpClient().Do(req)
+	if err != nil {
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 
-	a.APIKey.UpdateRateLimitInfo(resp) // now needs a lock — see below
-
-	if a.APIKey.RateLimitExceeded() { // ditto
-		return nil, errors.New("API rate limit exceeded, try again later")
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("API request failed with status code: %d", resp.StatusCode)
-	}
-
-	reader, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return unwrap(reader) // free function now, returns instead of writing to a.Response/a.Responses
+
+	if resp.StatusCode != http.StatusOK {
+		apiErr := &APIError{StatusCode: resp.StatusCode}
+		_ = json.Unmarshal(body, apiErr) // best effort; a non-JSON body still yields a useful error
+		return nil, resp.Header, apiErr
+	}
+	return body, resp.Header, nil
 }
 
-// unwrap takes the json object received from the API call and unwraps it to an array of ApodResponse structs
-func unwrap(resp []byte) ([]ApodResponse, error) {
-	var single ApodResponse
-	if err := json.Unmarshal(resp, &single); err == nil {
-		return []ApodResponse{single}, nil
+// fetchDate retrieves the APOD for a single date via /apod-basic/{YYMMDD}.
+func (a *Apod) fetchDate(ctx context.Context, d ApodDate) (ApodResponse, error) {
+	body, _, err := a.get(ctx, "/"+d.Legacy(), nil)
+	if err != nil {
+		return ApodResponse{}, err
+	}
+	var resp ApodResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return ApodResponse{}, err
+	}
+	return resp, nil
+}
+
+// fetchPage retrieves one page of a date range and reports the total number
+// of pages (from the X-WP-TotalPages header; 0 if absent). Results are
+// returned in the API's order: newest first.
+func (a *Apod) fetchPage(ctx context.Context, dr ApodDateRange, page, perPage int) ([]ApodResponse, int, error) {
+	query := url.Values{}
+	query.Set("date_from", dr.StartDate.Legacy())
+	query.Set("date_to", dr.EndDate.Legacy())
+	query.Set("page", strconv.Itoa(page))
+	query.Set("per_page", strconv.Itoa(perPage))
+
+	body, header, err := a.get(ctx, "", query)
+	if err != nil {
+		return nil, 0, err
 	}
 
-	var multiple []ApodResponse
-	if err := json.Unmarshal(resp, &multiple); err != nil {
-		return nil, err
+	var resps []ApodResponse
+	if err := json.Unmarshal(body, &resps); err != nil {
+		return nil, 0, err
 	}
-	return multiple, nil
+
+	totalPages, _ := strconv.Atoi(header.Get("X-WP-TotalPages"))
+	return resps, totalPages, nil
+}
+
+// fetchRange retrieves every APOD in the range by walking all of its pages
+// sequentially.
+func (a *Apod) fetchRange(ctx context.Context, dr ApodDateRange) ([]ApodResponse, error) {
+	var all []ApodResponse
+	for page := 1; ; page++ {
+		resps, totalPages, err := a.fetchPage(ctx, dr, page, MaxPerPage)
+		if err != nil {
+			return all, err
+		}
+		all = append(all, resps...)
+		if len(resps) == 0 || page >= totalPages {
+			return all, nil
+		}
+	}
 }
 
 func getTodayDate() ApodDate {
@@ -190,9 +251,14 @@ func (d ApodDate) String() string {
 	return d.Format(DateFormat)
 }
 
-// Set parses and sets the date value
+// Legacy returns the date as the legacy YYMMDD code used in request URLs.
+func (d ApodDate) Legacy() string {
+	return d.Format(LegacyDateFormat)
+}
+
+// Set parses and sets the date value. It accepts "today", YYYY-MM-DD, or
+// the legacy YYMMDD code.
 func (d *ApodDate) Set(value string) error {
-	// Validate the date format
 	if value == "today" {
 		*d = getTodayDate()
 		return nil
@@ -200,7 +266,11 @@ func (d *ApodDate) Set(value string) error {
 
 	t, err := time.Parse(DateFormat, value)
 	if err != nil {
-		return fmt.Errorf("invalid date format: %s, expected YYYY-MM-DD", value)
+		if lt, lerr := time.Parse(LegacyDateFormat, value); lerr == nil && len(value) == len(LegacyDateFormat) {
+			t = lt
+		} else {
+			return fmt.Errorf("invalid date format: %s, expected YYYY-MM-DD or YYMMDD", value)
+		}
 	}
 
 	if t.Before(firstApodDate().Time) {
@@ -211,9 +281,15 @@ func (d *ApodDate) Set(value string) error {
 	return nil
 }
 
-// Fetch retrieves the APOD for this single date.
-func (d *ApodDate) Fetch(a *Apod) ([]ApodResponse, error) {
-	return a.doFetch(apodQuery{date: d})
+// Fetch retrieves the APOD for this single date. The returned slice holds
+// exactly one response on success; a missing date yields an *APIError whose
+// NotFound method reports true.
+func (d *ApodDate) Fetch(ctx context.Context, a *Apod) ([]ApodResponse, error) {
+	resp, err := a.fetchDate(ctx, *d)
+	if err != nil {
+		return nil, err
+	}
+	return []ApodResponse{resp}, nil
 }
 
 // ApodDateRange is a custom type for handling date range parsing and validation
@@ -252,6 +328,7 @@ func (dr *ApodDateRange) Set(value string) error {
 	dr.StartDate = startDate
 	dr.EndDate = endDate
 
+	dr.len = 0
 	for range dr.All() {
 		dr.len++
 	}
@@ -298,25 +375,29 @@ func (dr *ApodDateRange) chunk(size int) []ApodDateRange {
 	return chunks
 }
 
-// Fetch retrieves the APOD for every date in the range in a single API
-// call. For ranges longer than MaximumApodRange, use FetchinBatches
-// instead.
-func (dr *ApodDateRange) Fetch(a *Apod) ([]ApodResponse, error) {
-	return a.doFetch(apodQuery{dateRange: dr})
+// Fetch retrieves the APOD for every date in the range, walking all of the
+// range's pages one after another (MaxPerPage results per request). Results
+// are in the API's order, newest first. For large ranges, FetchinBatches
+// fetches concurrently and streams results as they arrive.
+func (dr *ApodDateRange) Fetch(ctx context.Context, a *Apod) ([]ApodResponse, error) {
+	return a.fetchRange(ctx, *dr)
 }
 
-// FetchinBatches fetches a date range too large for a single API call by
-// splitting it into chunks of batchSize days (each chunk is one API call,
-// clamped to at most MaximumApodRange) and fetching up to concurrent
-// chunks at a time. A response isn't visible on the returned channel until
-// its whole chunk's API call completes, so a smaller batchSize trades more
-// total requests for more frequent, incremental results instead of long
-// silences while a large chunk is in flight. Responses and errors are
-// delivered on the returned channels as they complete; both channels are
-// closed once every chunk has been processed.
+// FetchinBatches fetches a date range by splitting it into chunks of
+// batchSize days (clamped to at most MaximumApodRange, so every chunk fits
+// in a single API request) and fetching up to concurrent chunks at a time.
+// A response isn't visible on the returned channel until its whole chunk's
+// API call completes, so a smaller batchSize trades more total requests for
+// more frequent, incremental results instead of long silences while a large
+// chunk is in flight. Responses and errors are delivered on the returned
+// channels as they complete; both channels are closed once every chunk has
+// been processed.
 func (dr *ApodDateRange) FetchinBatches(ctx context.Context, a *Apod, concurrent int, batchSize int) (<-chan ApodResponse, <-chan error) {
 	if batchSize <= 0 || batchSize > MaximumApodRange {
 		batchSize = MaximumApodRange
+	}
+	if concurrent <= 0 {
+		concurrent = 1
 	}
 
 	chunks := dr.chunk(batchSize)
@@ -347,7 +428,7 @@ func (dr *ApodDateRange) FetchinBatches(ctx context.Context, a *Apod, concurrent
 			default:
 			}
 
-			resps, err := a.doFetch(apodQuery{dateRange: &chunk})
+			resps, err := a.fetchRange(ctx, chunk)
 			if err != nil {
 				errChan <- fmt.Errorf("error fetching APOD data for %s: %w", chunk.String(), err)
 				return
@@ -389,117 +470,178 @@ func (c *ApodCount) Set(value string) error {
 	return nil
 }
 
-// Fetch retrieves Count randomly chosen APODs.
-func (c *ApodCount) Fetch(a *Apod) ([]ApodResponse, error) {
-	return a.doFetch(apodQuery{count: c})
-}
-
-// ApodAPIKey is a custom type for handling API key parsing and validation
-type ApodAPIKey struct {
-	Key                string // Key is the API key sent to NASA's API, defaults to "DEMO_KEY"
-	RateLimit          int    // RateLimit is the key's hourly request limit, from the X-RateLimit-Limit header
-	RateLimitRemaining int    // RateLimitRemaining is the requests left this hour, from the X-RateLimit-Remaining header; -1 until known
-
-	mu sync.Mutex // Mutex to protect concurrent access to RateLimitRemaining
-}
-
-// String returns the string representation of the API key
-func (k *ApodAPIKey) String() string {
-	return string(k.Key)
-}
-
-// Set sets the API key value and initializes the rate limit information
-func (k *ApodAPIKey) Set(value string) error {
-	var rateLimit int
-	if value == "" {
-		// Fall back to the environment variable; goapod defaults to "DEMO_KEY"
-		// if the key is still empty.
-		envValue, exists := os.LookupEnv("NASA_API_KEY")
-		if !exists || envValue == "" {
-			envValue = "DEMO_KEY"
-		}
-		value = envValue
-
-		rateLimit = DemoKeyLimit
-
-	} else {
-		rateLimit = APIKeyLimit
+// Fetch retrieves Count randomly chosen APODs. The API has no random
+// endpoint, so distinct random dates between FirstDate and today are drawn
+// and fetched individually, RandomConcurrency requests at a time. Dates
+// with no APOD are skipped and redrawn.
+func (c *ApodCount) Fetch(ctx context.Context, a *Apod) ([]ApodResponse, error) {
+	n := int(*c)
+	if n <= 0 {
+		return nil, errors.New("count must be a positive integer")
 	}
 
-	k.Key = value
-	k.RateLimitRemaining = -1 // Unknown rate limit remaining
-	k.RateLimit = rateLimit
+	first := firstApodDate()
+	days := int(getTodayDate().Sub(first.Time).Hours()/24) + 1
+	if n > days {
+		return nil, fmt.Errorf("count %d exceeds the number of days since %s", n, FirstDate)
+	}
 
+	tried := make(map[int]bool)
+	var results []ApodResponse
+	var errs []error
+
+	// Work in rounds: each round draws one fresh date per missing result
+	// and fetches them concurrently. Dates without an APOD are dropped, so
+	// the next round redraws for whatever is still missing. Rounds stop once
+	// n results are in, a request fails, or the attempt budget is spent.
+	maxAttempts := min(n*4, days)
+	attempts := 0
+	for len(results) < n && attempts < maxAttempts && len(errs) == 0 {
+		if err := ctx.Err(); err != nil {
+			return results, err
+		}
+		missing := min(n-len(results), maxAttempts-attempts)
+		dates := make([]ApodDate, 0, missing)
+		for len(dates) < missing {
+			offset := rand.IntN(days)
+			if tried[offset] {
+				continue
+			}
+			tried[offset] = true
+			dates = append(dates, ApodDate{Time: first.AddDate(0, 0, offset)})
+		}
+		attempts += len(dates)
+
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, RandomConcurrency)
+		for _, d := range dates {
+			wg.Add(1)
+			go func(d ApodDate) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				resp, err := a.fetchDate(ctx, d)
+
+				mu.Lock()
+				defer mu.Unlock()
+				var apiErr *APIError
+				switch {
+				case err == nil:
+					results = append(results, resp)
+				case errors.As(err, &apiErr) && apiErr.NotFound():
+					// No APOD on this day; the next round redraws.
+				default:
+					errs = append(errs, fmt.Errorf("error fetching APOD data for %s: %w", d, err))
+				}
+			}(d)
+		}
+		wg.Wait()
+	}
+
+	if len(results) < n && len(errs) == 0 {
+		errs = append(errs, fmt.Errorf("only found %d of %d random APODs after %d attempts", len(results), n, attempts))
+	}
+	return results, errors.Join(errs...)
+}
+
+// PostID is a WordPress post ID. The API has returned it both as a JSON
+// number and as a JSON string, so both forms are accepted.
+type PostID int64
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (p *PostID) UnmarshalJSON(data []byte) error {
+	s := strings.Trim(string(data), `"`)
+	if s == "" || s == "null" {
+		*p = 0
+		return nil
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid post_id %s: %w", string(data), err)
+	}
+	*p = PostID(n)
 	return nil
 }
 
-// UpdateRateLimitInfo updates RateLimit and RateLimitRemaining from the
-// X-RateLimit-Limit and X-RateLimit-Remaining response headers.
-func (k *ApodAPIKey) UpdateRateLimitInfo(resp *http.Response) {
-	if resp == nil {
-		return
-	}
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	if limit := resp.Header.Get("X-RateLimit-Limit"); limit != "" {
-		if n, err := strconv.Atoi(limit); err == nil {
-			k.RateLimit = n
-		}
-	}
-
-	if remaining := resp.Header.Get("X-RateLimit-Remaining"); remaining != "" {
-		if n, err := strconv.Atoi(remaining); err == nil {
-			k.RateLimitRemaining = n
-		}
-	}
+// String returns the decimal representation of the post ID.
+func (p PostID) String() string {
+	return strconv.FormatInt(int64(p), 10)
 }
 
-// RateLimitExceeded checks if the rate limit has been exceeded
-func (k *ApodAPIKey) RateLimitExceeded() bool {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	return k.RateLimitRemaining == 0
-}
-
-// ApodResponse holds the response JSON object received by a successful call to the APOD API
+// ApodResponse holds the response JSON object received by a successful call
+// to the APOD Basic API. Explanation, Credit, and Copyright contain HTML
+// fragments; see PlainExplanation for a text-only explanation.
 type ApodResponse struct {
-	Date           string `json:"date"`
-	Explanation    string `json:"explanation"`
-	Hdurl          string `json:"hdurl"`
-	MediaType      string `json:"media_type"`
-	ServiceVersion string `json:"service_version"`
-	Title          string `json:"title"`
-	URL            string `json:"url"`
+	Date         string `json:"date"`           // APOD date in YYYY-MM-DD format
+	PostID       PostID `json:"post_id"`        // WordPress post ID
+	Title        string `json:"title"`          // APOD post title
+	Permalink    string `json:"permalink"`      // URL of the APOD post on science.nasa.gov
+	MediaType    string `json:"media_type"`     // Normalized media type: "image", "video", or "iframe"
+	Explanation  string `json:"explanation"`    // APOD explanation as an HTML fragment
+	Credit       string `json:"credit"`         // Image credit as an HTML fragment
+	Copyright    string `json:"copyright"`      // Copyright as an HTML fragment (currently identical to Credit)
+	Alt          string `json:"alt"`            // Alt text of the featured image
+	URL          string `json:"url"`            // APOD post URL; matches Permalink
+	Hdurl        string `json:"hdurl"`          // Full-size featured image URL when available (a poster frame for videos)
+	BasicHTML    string `json:"basic_html"`     // APOD Basic HTML document
+	BasicHTMLURL string `json:"basic_html_url"` // URL of the raw APOD Basic HTML document
+}
+
+var (
+	htmlTagRe        = regexp.MustCompile(`<[^>]*>`)
+	explanationLabel = regexp.MustCompile(`(?i)^\s*explanation:\s*`)
+)
+
+// StripHTML removes HTML tags from s, unescapes HTML entities, and collapses
+// runs of whitespace into single spaces.
+func StripHTML(s string) string {
+	s = htmlTagRe.ReplaceAllString(s, "")
+	s = html.UnescapeString(s)
+	s = strings.ReplaceAll(s, " ", " ")
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// PlainExplanation returns the explanation with HTML removed and the leading
+// "Explanation:" label dropped, matching the plain text the retired
+// api.nasa.gov API used to return.
+func (a *ApodResponse) PlainExplanation() string {
+	return explanationLabel.ReplaceAllString(StripHTML(a.Explanation), "")
+}
+
+// PlainCredit returns the credit with HTML removed.
+func (a *ApodResponse) PlainCredit() string {
+	return StripHTML(a.Credit)
 }
 
 // String returns a human-readable summary of the APOD response.
 func (a *ApodResponse) String() string {
-	return fmt.Sprintf("Date: %s\nTitle: %s\nExplanation: %s\nMedia Type: %s\nURL: %s\nHD URL: %s\nService Version: %s\n",
-		a.Date, a.Title, a.Explanation, a.MediaType, a.URL, a.Hdurl, a.ServiceVersion)
+	return fmt.Sprintf("Date: %s\nTitle: %s\nExplanation: %s\nCredit: %s\nMedia Type: %s\nURL: %s\nHD URL: %s\nPost ID: %s\n",
+		a.Date, a.Title, a.PlainExplanation(), a.PlainCredit(), a.MediaType, a.URL, a.Hdurl, a.PostID)
 }
 
-// FetchImage downloads the Apod Image in either hd or normal definition
-// if hdurl is set but not available the function will default to url
-func (a *ApodResponse) FetchImage(hdurl bool) ([]byte, error) {
-	var src string
-	if a.MediaType != "image" {
-		return nil, errors.New("apodResponse is not an image")
+// FetchImage downloads the full-size featured image (Hdurl). Video and
+// iframe APODs usually still have a featured image, which is what is
+// downloaded for them; an error is returned when no Hdurl is available.
+func (a *ApodResponse) FetchImage(ctx context.Context) ([]byte, error) {
+	if a.Hdurl == "" {
+		return nil, fmt.Errorf("apod %s has no featured image (hdurl)", a.Date)
 	}
 
-	if a.Hdurl != "" && hdurl {
-		src = a.Hdurl
-	} else {
-		src = a.URL
-	}
-
-	// make request to src to fetch the file
-	resp, err := http.Get(src)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.Hdurl, nil)
 	if err != nil {
-		return []byte{}, err
+		return nil, err
 	}
-
+	client := &http.Client{Timeout: DefaultTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	return body, err
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("image request failed with status code: %d", resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
 }

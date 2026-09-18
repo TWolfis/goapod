@@ -5,7 +5,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
+	"os/signal"
+	"path"
 	"strings"
 
 	"github.com/TWolfis/goapod"
@@ -16,7 +19,7 @@ const ProgramName = "afetch"
 
 // Global variables for flags
 var (
-	opts = Options{APIKey: &goapod.ApodAPIKey{}}
+	opts Options
 	help bool
 )
 
@@ -47,10 +50,7 @@ type Options struct {
 	Count       goapod.ApodCount
 	Concurrent  int
 	BatchSize   int
-	Thumbs      bool
 	Download    bool
-	Hdurl       bool
-	APIKey      *goapod.ApodAPIKey
 
 	conn     *pgx.Conn
 	dbBuffer []goapod.ApodResponse
@@ -61,15 +61,15 @@ type Options struct {
 const dbBatchSize = 100
 
 // apodFetchFunc fetches the responses for a single (non-batched) request.
-type apodFetchFunc func(a *goapod.Apod) ([]goapod.ApodResponse, error)
+type apodFetchFunc func(ctx context.Context, a *goapod.Apod) ([]goapod.ApodResponse, error)
 
 // Fetch fetches the APOD data for the configured options, printing (and
 // optionally downloading) each response as it arrives. Date, DateRange, and
 // Count are mutually exclusive, so exactly one of the cases below applies.
-func (o *Options) Fetch() error {
-	a := goapod.NewApod(o.APIKey, o.Date, o.DateRange, o.Count, o.Thumbs)
+func (o *Options) Fetch(ctx context.Context) error {
+	a := goapod.NewApod(o.Date, o.DateRange, o.Count)
 	if o.DatabaseURL != "" {
-		if err := o.InitDBConn(); err != nil {
+		if err := o.InitDBConn(ctx); err != nil {
 			return fmt.Errorf("failed to initialize database connection: %w", err)
 		}
 		defer o.conn.Close(context.Background())
@@ -78,13 +78,14 @@ func (o *Options) Fetch() error {
 	var err error
 	switch {
 	case !o.Date.IsZero():
-		err = o.fetch(a, o.Date.Fetch)
-	case o.DateRange.Len() > goapod.MaximumApodRange:
-		err = o.fetchBatched(a)
+		err = o.fetch(ctx, a, o.Date.Fetch)
+	case o.DateRange.Len() > goapod.MaxPerPage:
+		// More than one page of results: fetch the pages concurrently.
+		err = o.fetchBatched(ctx, a)
 	case !o.DateRange.StartDate.IsZero():
-		err = o.fetch(a, o.DateRange.Fetch)
+		err = o.fetch(ctx, a, o.DateRange.Fetch)
 	default:
-		err = o.fetch(a, o.Count.Fetch)
+		err = o.fetch(ctx, a, o.Count.Fetch)
 	}
 
 	if o.conn != nil {
@@ -93,9 +94,8 @@ func (o *Options) Fetch() error {
 	return err
 }
 
-func (o *Options) InitDBConn() error {
-	var conn *pgx.Conn
-	conn, err := pgx.Connect(context.Background(), string(o.DatabaseURL))
+func (o *Options) InitDBConn(ctx context.Context) error {
+	conn, err := pgx.Connect(ctx, string(o.DatabaseURL))
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -103,27 +103,41 @@ func (o *Options) InitDBConn() error {
 	return nil
 }
 
-// WriteToDB inserts a batch of responses in a single multi-row INSERT
+// WriteToDB upserts a batch of responses in a single multi-row INSERT
 // instead of one round trip per response. Rows whose apod_date already
-// exists are silently skipped, so re-fetching an overlapping range is safe.
+// exists are updated in place, so re-fetching an overlapping range is safe
+// and backfills columns that an older fetch (or the old API) left empty.
 func (o *Options) WriteToDB(resps []goapod.ApodResponse) error {
 	if len(resps) == 0 {
 		return nil
 	}
 
+	const cols = 11
 	var sql strings.Builder
-	sql.WriteString(`INSERT INTO apod (apod_date, title, explanation, media_type, url, hdurl, service_version) VALUES `)
+	sql.WriteString(`INSERT INTO apod (apod_date, post_id, title, explanation, credit, copyright, alt, media_type, url, hdurl, basic_html_url) VALUES `)
 
-	args := make([]any, 0, len(resps)*7)
+	args := make([]any, 0, len(resps)*cols)
 	for i, resp := range resps {
 		if i > 0 {
 			sql.WriteString(", ")
 		}
-		n := i * 7
-		fmt.Fprintf(&sql, "($%d, $%d, $%d, $%d, $%d, $%d, $%d)", n+1, n+2, n+3, n+4, n+5, n+6, n+7)
-		args = append(args, resp.Date, resp.Title, resp.Explanation, resp.MediaType, resp.URL, resp.Hdurl, resp.ServiceVersion)
+		sql.WriteString("(")
+		for j := range cols {
+			if j > 0 {
+				sql.WriteString(", ")
+			}
+			fmt.Fprintf(&sql, "$%d", i*cols+j+1)
+		}
+		sql.WriteString(")")
+		args = append(args,
+			resp.Date, int64(resp.PostID), resp.Title, resp.PlainExplanation(), resp.PlainCredit(), goapod.StripHTML(resp.Copyright),
+			resp.Alt, resp.MediaType, resp.URL, resp.Hdurl, resp.BasicHTMLURL)
 	}
-	sql.WriteString(" ON CONFLICT (apod_date) DO NOTHING")
+	sql.WriteString(` ON CONFLICT (apod_date) DO UPDATE SET
+		post_id = EXCLUDED.post_id, title = EXCLUDED.title, explanation = EXCLUDED.explanation,
+		credit = EXCLUDED.credit, copyright = EXCLUDED.copyright, alt = EXCLUDED.alt,
+		media_type = EXCLUDED.media_type, url = EXCLUDED.url, hdurl = EXCLUDED.hdurl,
+		basic_html_url = EXCLUDED.basic_html_url`)
 
 	if _, err := o.conn.Exec(context.Background(), sql.String(), args...); err != nil {
 		return fmt.Errorf("failed to insert APOD data into database: %w", err)
@@ -138,7 +152,7 @@ func (o *Options) flushDB() {
 		return
 	}
 	if err := o.WriteToDB(o.dbBuffer); err != nil {
-		fmt.Println("Error writing to database:", err)
+		fmt.Fprintln(os.Stderr, "Error writing to database:", err)
 	} else {
 		fmt.Printf("%d APOD row(s) written to database successfully.\n", len(o.dbBuffer))
 	}
@@ -146,8 +160,8 @@ func (o *Options) flushDB() {
 }
 
 // fetch runs a single request and handles every response it returns.
-func (o *Options) fetch(a *goapod.Apod, do apodFetchFunc) error {
-	responses, err := do(a)
+func (o *Options) fetch(ctx context.Context, a *goapod.Apod, do apodFetchFunc) error {
+	responses, err := do(ctx, a)
 	if err != nil {
 		return err
 	}
@@ -160,10 +174,11 @@ func (o *Options) fetch(a *goapod.Apod, do apodFetchFunc) error {
 
 // fetchBatched fetches a date range too large for a single request in
 // concurrent batches, handling each response as it streams in.
-func (o *Options) fetchBatched(a *goapod.Apod) error {
-	respChan, errChan := o.DateRange.FetchinBatches(context.Background(), a, o.Concurrent, o.BatchSize)
+func (o *Options) fetchBatched(ctx context.Context, a *goapod.Apod) error {
+	respChan, errChan := o.DateRange.FetchinBatches(ctx, a, o.Concurrent, o.BatchSize)
 
 	var errs []error
+	var cancelled bool
 	for respChan != nil || errChan != nil {
 		select {
 		case resp, ok := <-respChan:
@@ -177,8 +192,17 @@ func (o *Options) fetchBatched(a *goapod.Apod) error {
 				errChan = nil
 				continue
 			}
+			// Once the context is done every remaining chunk reports the same
+			// cancellation; keep it once rather than once per chunk.
+			if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+				cancelled = true
+				continue
+			}
 			errs = append(errs, err)
 		}
+	}
+	if cancelled {
+		errs = append(errs, ctx.Err())
 	}
 
 	return errors.Join(errs...)
@@ -198,8 +222,8 @@ func (o *Options) handle(resp goapod.ApodResponse) {
 	}
 
 	if o.Download {
-		if err := o.DownloadImage(resp); err != nil {
-			fmt.Println("Error downloading image:", err)
+		if err := o.DownloadImage(context.Background(), resp); err != nil {
+			fmt.Fprintln(os.Stderr, "Error downloading image:", err)
 		} else {
 			fmt.Println("Image downloaded successfully.")
 		}
@@ -211,17 +235,43 @@ func (o *Options) String(a goapod.ApodResponse) string {
 	return a.String()
 }
 
-// DownloadImage saves the APOD image to the current directory, named after its title.
-func (o *Options) DownloadImage(r goapod.ApodResponse) error {
-	f := strings.ToLower(r.Title) + ".jpg"
-	f = strings.ReplaceAll(f, " ", "_")
-	img, err := r.FetchImage(o.Hdurl)
+// DownloadImage saves the APOD's full-size featured image to the current
+// directory, named after its title with the image URL's file extension.
+func (o *Options) DownloadImage(ctx context.Context, r goapod.ApodResponse) error {
+	img, err := r.FetchImage(ctx)
 	if err != nil {
 		return err
 	}
 
-	os.WriteFile(f, img, 0o644)
-	return nil
+	ext := ".jpg"
+	if u, err := url.Parse(r.Hdurl); err == nil {
+		if e := path.Ext(u.Path); e != "" {
+			ext = e
+		}
+	}
+
+	return os.WriteFile(imageFilename(r, ext), img, 0o644)
+}
+
+// imageFilename derives a safe file name from the APOD title: lower-cased,
+// spaces replaced by underscores, and any character that is not a letter,
+// digit, dash, or underscore dropped. It falls back to the date when the
+// title yields nothing usable.
+func imageFilename(r goapod.ApodResponse, ext string) string {
+	var b strings.Builder
+	for _, c := range strings.ToLower(r.Title) {
+		switch {
+		case c == ' ':
+			b.WriteByte('_')
+		case c == '-' || c == '_' || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'):
+			b.WriteRune(c)
+		}
+	}
+	name := strings.Trim(b.String(), "_")
+	if name == "" {
+		name = r.Date
+	}
+	return name + ext
 }
 
 // Custom usage function for better help formatting
@@ -229,9 +279,10 @@ func init() {
 	flag.Usage = func() {
 		fmt.Fprintf(flag.CommandLine.Output(), `afetch - NASA Astronomy Picture of the Day (APOD) Fetcher
 
-Fetches the Astronomy Picture of the Day from NASA's APOD API for a single
-date, a date range, or a batch of random dates. -d, -dr, and -c are mutually
-exclusive; with none set, afetch fetches today's APOD.
+Fetches the Astronomy Picture of the Day from NASA's APOD Basic API
+(science.nasa.gov) for a single date, a date range, or a batch of random
+dates. -d, -dr, and -c are mutually exclusive; with none set, afetch fetches
+today's APOD. No API key is needed.
 
 USAGE:
     %[1]s [FLAGS]
@@ -245,34 +296,29 @@ EXAMPLES:
     %[1]s -d 2023-07-20                    # Get APOD for a specific date
     %[1]s -dr "2023-07-01, 2023-07-07"     # Get APOD for a date range
     %[1]s -c 5                             # Get 5 random APODs
-    %[1]s -d 2023-07-20 -dl -hd            # Download HD image for a specific date
+    %[1]s -d 140918                        # Same, using the legacy YYMMDD date code
+    %[1]s -d 2023-07-20 -dl                # Download the full-size image for a specific date
     %[1]s -db "postgres://user:pass@localhost:5432/apod"  # Save APOD data to a PostgreSQL database
     %[1]s -dr "1995-06-16, today" -concurrent 20 -batch-size 15 -db "..."  # Fetch full history, streaming results as small chunks complete
 
 ENVIRONMENT VARIABLES:
-    NASA_API_KEY    NASA API key for APOD service (alternative to -api-key flag)
     DATABASE_URL    PostgreSQL database connection string (alternative to -db flag)
 
 `, ProgramName)
 	}
 
-	// Seed the default API key ($NASA_API_KEY, falling back to "DEMO_KEY") and
-	// database URL ($DATABASE_URL) up front, since flag.Var only calls Set
-	// when -api-key/-db is actually passed on the command line.
-	opts.APIKey.Set("")
+	// Seed the default database URL ($DATABASE_URL) up front, since flag.Var
+	// only calls Set when -db is actually passed on the command line.
 	opts.DatabaseURL.Set("")
 
 	// Define all flags
-	flag.BoolVar(&opts.Hdurl, "hd", true, "use the HD image URL when downloading")
-	flag.BoolVar(&opts.Download, "dl", false, "download the APOD image(s) to the current directory")
-	flag.Var(&opts.Date, "d", `date for APOD, format YYYY-MM-DD (or "today")`)
+	flag.BoolVar(&opts.Download, "dl", false, "download the full-size APOD image(s) to the current directory")
+	flag.Var(&opts.Date, "d", `date for APOD, format YYYY-MM-DD or YYMMDD (or "today")`)
 	flag.Var(&opts.DateRange, "dr", `date range for APOD, format "YYYY-MM-DD, YYYY-MM-DD"`)
 	flag.Var(&opts.Count, "c", "number of random APODs to fetch")
 	flag.IntVar(&opts.Concurrent, "concurrent", 10, "number of concurrent requests to make when batching a date range")
-	flag.IntVar(&opts.BatchSize, "batch-size", 30, fmt.Sprintf("days per API request when batching a date range (max %d); smaller values stream results back sooner at the cost of more requests", goapod.MaximumApodRange))
-	flag.BoolVar(&opts.Thumbs, "thumbs", false, "return video thumbnail URLs instead of the video URL")
+	flag.IntVar(&opts.BatchSize, "batch-size", goapod.MaximumApodRange, fmt.Sprintf("days per API request when batching a date range (max %d); smaller values stream results back sooner at the cost of more requests", goapod.MaximumApodRange))
 	flag.Var((&opts.DatabaseURL), "db", "PostgreSQL database connection string (or set DATABASE_URL environment variable)")
-	flag.Var(opts.APIKey, "api-key", "NASA API key for APOD service (defaults to $NASA_API_KEY, then DEMO_KEY)")
 
 	flag.BoolVar(&help, "h", false, "show this help message")
 }
@@ -287,7 +333,7 @@ func main() {
 
 	// Count and Database URL are mutually exclusive; if both are set, print an error and exit
 	if opts.Count > 0 && opts.DatabaseURL != "" {
-		fmt.Println("Error: -c and -db flags are mutually exclusive.")
+		fmt.Fprintln(os.Stderr, "Error: -c and -db flags are mutually exclusive.")
 		os.Exit(1)
 	}
 
@@ -296,8 +342,13 @@ func main() {
 		opts.Date.Set("today")
 	}
 
-	if err := opts.Fetch(); err != nil {
-		fmt.Println("Error fetching APOD data:", err)
+	// Ctrl-C cancels in-flight requests instead of killing the process
+	// mid-batch, so buffered database rows still get flushed.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	if err := opts.Fetch(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "Error fetching APOD data:", err)
 		os.Exit(1)
 	}
 }

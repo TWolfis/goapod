@@ -1,6 +1,5 @@
 # ignore executables
 cmd/afetch/bin
-
-go.sum
+cmd/afetch/afetch
 
 Makefile
